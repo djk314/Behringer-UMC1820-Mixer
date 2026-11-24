@@ -1,0 +1,10 @@
+{
+  "name": "UMC1820 Studio Mixer — Console & Architecture Rust",
+  "description": "Console de mixage virtuelle 8 entrées, 4 bus Aux stéréo et Master pour Behringer UMC1820 avec inserts VST2/VST3/AU (max 5), EQ 4 bandes, et code source complet Rust (egui + CoreAudio/ALSA).",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
