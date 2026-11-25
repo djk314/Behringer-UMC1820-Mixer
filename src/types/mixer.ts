@@ -28,9 +28,10 @@ export interface InsertPluginSlot {
   params: Record<string, number>;
 }
 
-export interface FourBandEq {
+export interface FiveBandEq {
   lowGainDb: number;     // 80 Hz Low Shelf (-15 .. +15 dB)
   lowMidGainDb: number;  // 400 Hz Peaking (-15 .. +15 dB)
+  midGainDb: number;     // 1 kHz Peaking (-15 .. +15 dB) — 5ème potentiomètre central
   highMidGainDb: number; // 2.5 kHz Peaking (-15 .. +15 dB)
   highGainDb: number;    // 10 kHz High Shelf (-15 .. +15 dB)
   bypassed: boolean;
@@ -46,20 +47,46 @@ export type InputSourceKind =
   | 'sine_1k'
   | 'microphone';
 
+export type HardwareInputRoute =
+  | { kind: 'none' }
+  | { kind: 'mono'; channel: number }
+  | { kind: 'stereo'; channel: number };
+
+export type HardwareOutputRoute =
+  | { kind: 'none' }
+  | { kind: 'master' }
+  | { kind: 'mono'; channel: number }
+  | { kind: 'stereo'; channel: number };
+
+export type AuxSendsTuple = [
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+];
+
+export type AuxPairStereoState = [boolean, boolean, boolean, boolean];
+
 export interface StripState {
   id: string;
   index: number;
   kind: StripKind;
   name: string;
   hardwareChannelLabel: string;
+  inputRoute: HardwareInputRoute;
+  outputRoute: HardwareOutputRoute;
   /** Rotary Gain (-12 dB .. +24 dB). Not rendered/active on Master strip. */
   gainDb: number;
   /** Maximum 5 insert plugins per strip (VST2 / VST3 / Apple AU). */
   inserts: InsertPluginSlot[];
-  /** 4-band rotary EQ. */
-  eq: FourBandEq;
-  /** 4 auxiliary rotary sends targeting UMC1820 Stereo Outputs 1/2, 3/4, 5/6, 7/8 (0..100%). */
-  auxSends: [number, number, number, number];
+  /** 5-band rotary EQ (with center Mid band). */
+  eq: FiveBandEq;
+  /** 8 auxiliary rotary sends (4 stereo pairs or 8 independent mono buses, 0..100%). */
+  auxSends: AuxSendsTuple;
   /** Solo push button (On/Off). Absent on Master strip. */
   solo: boolean;
   /** Mute push button (On/Off). */
@@ -68,6 +95,22 @@ export interface StripState {
   volumeDb: number;
   /** Simulated / live audio source for Web Audio testing on input strips. */
   source: InputSourceKind;
+}
+
+export interface MixerSetSnapshot {
+  version: number;
+  auxPairStereo: AuxPairStereoState;
+  strips: StripState[];
+  playerLoop?: boolean;
+  playerGain?: number;
+  playerTargetStripId?: string | null;
+}
+
+export interface PlayerStatus {
+  title: string | null;
+  playing: boolean;
+  posSecs: number;
+  durationSecs: number;
 }
 
 export interface MeterLevel {
@@ -79,6 +122,8 @@ export interface MeterLevel {
 }
 
 export const MAX_INSERTS_PER_STRIP = 5;
+export const MAX_AUX_PAIRS = 4;
+export const NUM_AUX_BUSES = 8;
 
 export const PLUGIN_CATALOG: PluginDescriptor[] = [
   {
@@ -146,9 +191,22 @@ export const PLUGIN_CATALOG: PluginDescriptor[] = [
   },
 ];
 
-export const AUX_LABELS: [string, string, string, string] = [
+export const AUX_PAIR_LABELS: [string, string, string, string] = [
   'Aux 1/2',
   'Aux 3/4',
   'Aux 5/6',
   'Aux 7/8',
 ];
+
+export function formatInputRouteLabel(route: HardwareInputRoute): string {
+  if (route.kind === 'none') return 'Aucune (Synth/WAV)';
+  if (route.kind === 'mono') return `Entrée In ${route.channel + 1}`;
+  return `Paire In ${route.channel + 1}/${route.channel + 2}`;
+}
+
+export function formatOutputRouteLabel(route: HardwareOutputRoute): string {
+  if (route.kind === 'none') return 'Sortie: Aucune';
+  if (route.kind === 'master') return 'Vers Master';
+  if (route.kind === 'mono') return `Sortie Out ${route.channel + 1}`;
+  return `Sortie Out ${route.channel + 1}/${route.channel + 2}`;
+}

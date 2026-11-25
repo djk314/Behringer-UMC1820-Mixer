@@ -1,4 +1,4 @@
-use super::state::{FourBandEqParams, MeterFrame};
+use super::state::{FiveBandEqParams, MeterFrame};
 use std::f32::consts::PI;
 
 #[inline]
@@ -114,19 +114,21 @@ impl Biquad {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct FourBandEqProcessor {
+pub struct FiveBandEqProcessor {
     low: Biquad,
     low_mid: Biquad,
+    mid: Biquad,
     high_mid: Biquad,
     high: Biquad,
     bypassed: bool,
 }
 
-impl FourBandEqProcessor {
-    pub fn update(&mut self, sample_rate: f32, params: FourBandEqParams) {
+impl FiveBandEqProcessor {
+    pub fn update(&mut self, sample_rate: f32, params: FiveBandEqParams) {
         self.bypassed = params.bypassed;
         self.low.set_low_shelf(sample_rate, 80.0, params.low_db);
         self.low_mid.set_peaking(sample_rate, 400.0, 1.0, params.low_mid_db);
+        self.mid.set_peaking(sample_rate, 1000.0, 1.0, params.mid_db);
         self.high_mid.set_peaking(sample_rate, 2500.0, 1.0, params.high_mid_db);
         self.high.set_high_shelf(sample_rate, 10_000.0, params.high_db);
     }
@@ -138,6 +140,7 @@ impl FourBandEqProcessor {
         }
         (l, r) = self.low.process_stereo(l, r);
         (l, r) = self.low_mid.process_stereo(l, r);
+        (l, r) = self.mid.process_stereo(l, r);
         (l, r) = self.high_mid.process_stereo(l, r);
         self.high.process_stereo(l, r)
     }

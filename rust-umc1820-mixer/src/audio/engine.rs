@@ -1,49 +1,214 @@
-use super::dsp::{db_to_linear, BallisticMeter, FourBandEqProcessor};
+use super::dsp::{db_to_linear, BallisticMeter, FiveBandEqProcessor};
+use super::player::DecodedAudioTrack;
 use super::plugin_host::{HostedPlugin, StripInsertRack};
 use super::state::{
-    MeterFrame, MixerCommand, StripKind, StripState, MAX_INSERTS_PER_STRIP, NUM_AUX_STRIPS,
+    InputSourceRoute, MeterFrame, MidiMessage, MixerCommand, OutputTargetRoute, PlayerProgress,
+    StripKind, StripState, MAX_AUX_PAIRS, MAX_INSERTS_PER_STRIP, NUM_AUX_STRIPS,
     NUM_INPUT_STRIPS, TOTAL_STRIPS,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, SampleRate, Stream, StreamConfig};
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::HeapRb;
+use std::sync::Arc;
 
 pub struct AudioEngineHandle {
     pub command_tx: ringbuf::HeapProd<MixerCommand>,
+    pub midi_tx: Option<ringbuf::HeapProd<MidiMessage>>,
     pub meter_rx: ringbuf::HeapCons<[MeterFrame; TOTAL_STRIPS]>,
+    pub player_rx: ringbuf::HeapCons<PlayerProgress>,
     pub retired_plugin_rx: ringbuf::HeapCons<Box<dyn HostedPlugin>>,
+    pub retired_track_rx: ringbuf::HeapCons<Arc<DecodedAudioTrack>>,
     pub device_name: String,
     pub sample_rate: u32,
     pub buffer_frames: u32,
+    pub in_channels: usize,
+    pub out_channels: usize,
     _input_stream: Option<Stream>,
     _output_stream: Option<Stream>,
 }
 
 struct StripDspRuntime {
     kind: StripKind,
+    input_route: InputSourceRoute,
+    output_route: OutputTargetRoute,
     gain_db: f32,
     volume_db: f32,
     mute: bool,
     solo: bool,
+    midi_mode: Option<u8>,
     aux_sends: [f32; NUM_AUX_STRIPS],
-    eq: FourBandEqProcessor,
+    eq: FiveBandEqProcessor,
     inserts: StripInsertRack,
     meter: BallisticMeter,
 }
 
 impl StripDspRuntime {
-    fn new(kind: StripKind) -> Self {
+    fn new(index: usize, kind: StripKind, out_channels: usize) -> Self {
+        let input_route = if kind == StripKind::Input {
+            InputSourceRoute::Mono(index)
+        } else {
+            InputSourceRoute::None
+        };
+        let output_route = match kind {
+            StripKind::Input => OutputTargetRoute::None,
+            StripKind::Aux => {
+                let aux_i = index.saturating_sub(NUM_INPUT_STRIPS);
+                if aux_i % 2 == 0 {
+                    OutputTargetRoute::StereoPair(aux_i)
+                } else {
+                    OutputTargetRoute::Mono(aux_i)
+                }
+            }
+            StripKind::Master => {
+                if out_channels >= 10 {
+                    OutputTargetRoute::StereoPair(8)
+                } else {
+                    OutputTargetRoute::StereoPair(0)
+                }
+            }
+        };
         Self {
             kind,
+            input_route,
+            output_route,
             gain_db: 0.0,
             volume_db: 0.0,
             mute: false,
             solo: false,
+            midi_mode: if kind == StripKind::Input { Some(0) } else { None },
             aux_sends: [0.0; NUM_AUX_STRIPS],
-            eq: FourBandEqProcessor::default(),
+            eq: FiveBandEqProcessor::default(),
             inserts: StripInsertRack::default(),
             meter: BallisticMeter::default(),
+        }
+    }
+}
+
+struct PlayerRuntime {
+    track: Option<Arc<DecodedAudioTrack>>,
+    pos_frames: f64,
+    playing: bool,
+    looping: bool,
+    gain: f32,
+    target: Option<usize>,
+}
+
+impl Default for PlayerRuntime {
+    fn default() -> Self {
+        Self {
+            track: None,
+            pos_frames: 0.0,
+            playing: false,
+            looping: false,
+            gain: 1.0,
+            target: None,
+        }
+    }
+}
+
+impl PlayerRuntime {
+    fn render(&mut self, out_l: &mut [f32], out_r: &mut [f32], engine_sr: f32) -> PlayerProgress {
+        out_l.fill(0.0);
+        out_r.fill(0.0);
+        let Some(track) = self.track.as_ref() else {
+            self.playing = false;
+            return PlayerProgress::default();
+        };
+        let len = track.left.len();
+        if len == 0 || track.sample_rate == 0 {
+            self.playing = false;
+            return PlayerProgress::default();
+        }
+        let duration_secs = len as f32 / track.sample_rate as f32;
+        if self.playing {
+            let step = f64::from(track.sample_rate) / f64::from(engine_sr.max(1.0));
+            let gain = self.gain;
+            for i in 0..out_l.len() {
+                let idx = self.pos_frames.floor() as usize;
+                if idx >= len {
+                    if self.looping {
+                        self.pos_frames = 0.0;
+                    } else {
+                        self.playing = false;
+                        self.pos_frames = 0.0;
+                        break;
+                    }
+                }
+                let i0 = (self.pos_frames.floor() as usize).min(len - 1);
+                let i1 = (i0 + 1).min(len - 1);
+                let frac = (self.pos_frames - i0 as f64) as f32;
+                let sl = track.left[i0] + (track.left[i1] - track.left[i0]) * frac;
+                let sr = track.right[i0] + (track.right[i1] - track.right[i0]) * frac;
+                out_l[i] = sl * gain;
+                out_r[i] = sr * gain;
+                self.pos_frames += step;
+            }
+        }
+        let pos_secs = ((self.pos_frames as f32) / track.sample_rate as f32).clamp(0.0, duration_secs);
+        PlayerProgress {
+            playing: self.playing,
+            pos_secs,
+            duration_secs,
+        }
+    }
+}
+
+#[inline]
+fn filter_midi_for_strip(
+    mode: Option<u8>,
+    src: &[MidiMessage],
+    dst: &mut [MidiMessage; 128],
+) -> usize {
+    let Some(target) = mode else {
+        return 0;
+    };
+    if target == 0 {
+        let n = src.len().min(128);
+        dst[..n].copy_from_slice(&src[..n]);
+        return n;
+    }
+    let mut n = 0;
+    for &m in src {
+        if m.channel() == Some(target) {
+            dst[n] = m;
+            n += 1;
+            if n == 128 {
+                break;
+            }
+        }
+    }
+    n
+}
+
+#[inline]
+fn mix_to_hardware(
+    route: OutputTargetRoute,
+    bus_l: &[f32],
+    bus_r: &[f32],
+    out: &mut [f32],
+    frames: usize,
+    out_channels: usize,
+) {
+    match route {
+        OutputTargetRoute::None | OutputTargetRoute::MasterBus => {}
+        OutputTargetRoute::Mono(ch) => {
+            if ch < out_channels {
+                for f in 0..frames {
+                    out[f * out_channels + ch] += 0.5 * (bus_l[f] + bus_r[f]);
+                }
+            }
+        }
+        OutputTargetRoute::StereoPair(ch) => {
+            if ch < out_channels {
+                for f in 0..frames {
+                    let base = f * out_channels;
+                    out[base + ch] += bus_l[f];
+                    if ch + 1 < out_channels {
+                        out[base + ch + 1] += bus_r[f];
+                    }
+                }
+            }
         }
     }
 }
@@ -98,14 +263,18 @@ pub fn start_audio_engine(preferred_device: Option<&str>) -> Result<AudioEngineH
     let out_channels = supported_out.channels() as usize;
     let buffer_frames = 128_u32;
 
-    let (cmd_tx, mut cmd_rx) = HeapRb::<MixerCommand>::new(256).split();
+    let (cmd_tx, mut cmd_rx) = HeapRb::<MixerCommand>::new(512).split();
+    let (midi_tx, mut midi_rx) = HeapRb::<MidiMessage>::new(512).split();
     let (mut meter_tx, meter_rx) = HeapRb::<[MeterFrame; TOTAL_STRIPS]>::new(16).split();
+    let (mut player_tx, player_rx) = HeapRb::<PlayerProgress>::new(16).split();
     let (mut retired_tx, retired_plugin_rx) =
         HeapRb::<Box<dyn HostedPlugin>>::new(32).split();
+    let (mut retired_track_tx, retired_track_rx) =
+        HeapRb::<Arc<DecodedAudioTrack>>::new(8).split();
     let (mut audio_in_tx, mut audio_in_rx) = HeapRb::<f32>::new(sample_rate as usize * 8).split();
 
     let mut input_stream = None;
-    let mut in_channels = 2_usize;
+    let mut in_channels = 0_usize;
 
     if let Some(in_dev) = input_device {
         if let Ok(in_cfg) = in_dev.default_input_config() {
@@ -130,7 +299,8 @@ pub fn start_audio_engine(preferred_device: Option<&str>) -> Result<AudioEngineH
                     None,
                 )
                 .or_else(|_| {
-                    let (mut tx2, rx2) = HeapRb::<f32>::new(sample_rate as usize * in_channels.max(18)).split();
+                    let (mut tx2, rx2) =
+                        HeapRb::<f32>::new(sample_rate as usize * in_channels.max(18)).split();
                     audio_in_rx = rx2;
                     in_dev.build_input_stream(
                         &default_cfg,
@@ -151,14 +321,16 @@ pub fn start_audio_engine(preferred_device: Option<&str>) -> Result<AudioEngineH
     let mut runtimes: Vec<StripDspRuntime> = (0..TOTAL_STRIPS)
         .map(|i| {
             if i < NUM_INPUT_STRIPS {
-                StripDspRuntime::new(StripKind::Input)
+                StripDspRuntime::new(i, StripKind::Input, out_channels)
             } else if i < NUM_INPUT_STRIPS + NUM_AUX_STRIPS {
-                StripDspRuntime::new(StripKind::Aux)
+                StripDspRuntime::new(i, StripKind::Aux, out_channels)
             } else {
-                StripDspRuntime::new(StripKind::Master)
+                StripDspRuntime::new(i, StripKind::Master, out_channels)
             }
         })
         .collect();
+    let mut aux_pair_stereo = [true; MAX_AUX_PAIRS];
+    let mut player = PlayerRuntime::default();
 
     let out_cfg = StreamConfig {
         channels: out_channels as u16,
@@ -170,8 +342,10 @@ pub fn start_audio_engine(preferred_device: Option<&str>) -> Result<AudioEngineH
     let mut scratch_in = vec![0.0_f32; 2048 * in_channels.max(18)];
     let mut block_l = vec![0.0_f32; 2048];
     let mut block_r = vec![0.0_f32; 2048];
-    let mut aux_bus_l = [vec![0.0_f32; 2048], vec![0.0_f32; 2048], vec![0.0_f32; 2048], vec![0.0_f32; 2048]];
-    let mut aux_bus_r = [vec![0.0_f32; 2048], vec![0.0_f32; 2048], vec![0.0_f32; 2048], vec![0.0_f32; 2048]];
+    let mut player_l = vec![0.0_f32; 2048];
+    let mut player_r = vec![0.0_f32; 2048];
+    let mut aux_bus_l: Vec<Vec<f32>> = (0..NUM_AUX_STRIPS).map(|_| vec![0.0_f32; 2048]).collect();
+    let mut aux_bus_r: Vec<Vec<f32>> = (0..NUM_AUX_STRIPS).map(|_| vec![0.0_f32; 2048]).collect();
     let mut master_l = vec![0.0_f32; 2048];
     let mut master_r = vec![0.0_f32; 2048];
 
@@ -215,6 +389,26 @@ pub fn start_audio_engine(preferred_device: Option<&str>) -> Result<AudioEngineH
                                 runtimes[strip].aux_sends[aux_idx] = level;
                             }
                         }
+                        MixerCommand::SetAuxPairStereo { pair, stereo } => {
+                            if pair < MAX_AUX_PAIRS {
+                                aux_pair_stereo[pair] = stereo;
+                            }
+                        }
+                        MixerCommand::SetInputRoute { strip, route } => {
+                            if strip < NUM_INPUT_STRIPS {
+                                runtimes[strip].input_route = route;
+                            }
+                        }
+                        MixerCommand::SetOutputRoute { strip, route } => {
+                            if strip >= NUM_INPUT_STRIPS && strip < TOTAL_STRIPS {
+                                runtimes[strip].output_route = route;
+                            }
+                        }
+                        MixerCommand::SetStripMidiMode { strip, mode } => {
+                            if strip < TOTAL_STRIPS {
+                                runtimes[strip].midi_mode = mode;
+                            }
+                        }
                         MixerCommand::InstallInsert { strip, slot, plugin } => {
                             if strip < TOTAL_STRIPS && slot < MAX_INSERTS_PER_STRIP {
                                 let prev = std::mem::replace(
@@ -236,13 +430,62 @@ pub fn start_audio_engine(preferred_device: Option<&str>) -> Result<AudioEngineH
                                 runtimes[strip].inserts.set_parameter(slot, param_id, value);
                             }
                         }
+                        MixerCommand::LoadAudioTrack(new_track) => {
+                            player.playing = false;
+                            player.pos_frames = 0.0;
+                            if let Some(old) = std::mem::replace(&mut player.track, new_track) {
+                                let _ = retired_track_tx.try_push(old);
+                            }
+                        }
+                        MixerCommand::PlayerPlay => {
+                            if player.track.is_some() {
+                                player.playing = true;
+                            }
+                        }
+                        MixerCommand::PlayerPause => {
+                            player.playing = false;
+                        }
+                        MixerCommand::PlayerStop => {
+                            player.playing = false;
+                            player.pos_frames = 0.0;
+                        }
+                        MixerCommand::PlayerSeek(secs) => {
+                            if let Some(track) = player.track.as_ref() {
+                                let max_f = track.left.len().saturating_sub(1) as f64;
+                                player.pos_frames =
+                                    (f64::from(secs.max(0.0)) * f64::from(track.sample_rate)).min(max_f);
+                            }
+                        }
+                        MixerCommand::PlayerSetLoop(looping) => {
+                            player.looping = looping;
+                        }
+                        MixerCommand::PlayerSetGain(gain) => {
+                            player.gain = gain.clamp(0.0, 2.0);
+                        }
+                        MixerCommand::PlayerSetTarget(target) => {
+                            player.target = target.filter(|&i| i < NUM_INPUT_STRIPS);
+                        }
                     }
                 }
 
-                let frames = (out.len() / out_channels).min(2048);
-                let needed_in = frames * in_channels;
-                scratch_in[..needed_in].fill(0.0);
-                let _ = audio_in_rx.pop_slice(&mut scratch_in[..needed_in]);
+                let mut midi_buf = [MidiMessage::default(); 128];
+                let mut midi_count = 0_usize;
+                while midi_count < midi_buf.len() {
+                    if let Some(m) = midi_rx.try_pop() {
+                        midi_buf[midi_count] = m;
+                        midi_count += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let mut strip_midi = [MidiMessage::default(); 128];
+
+                let frames = (out.len() / out_channels.max(1)).min(2048);
+                if in_channels > 0 {
+                    let needed_in = frames * in_channels;
+                    scratch_in[..needed_in].fill(0.0);
+                    let _ = audio_in_rx.pop_slice(&mut scratch_in[..needed_in]);
+                }
 
                 for b in 0..NUM_AUX_STRIPS {
                     aux_bus_l[b][..frames].fill(0.0);
@@ -251,26 +494,75 @@ pub fn start_audio_engine(preferred_device: Option<&str>) -> Result<AudioEngineH
                 master_l[..frames].fill(0.0);
                 master_r[..frames].fill(0.0);
 
-                let any_solo = runtimes[..NUM_INPUT_STRIPS + NUM_AUX_STRIPS]
-                    .iter()
-                    .any(|r| r.solo);
+                // Rendu du lecteur MP3/WAV
+                let progress = player.render(&mut player_l[..frames], &mut player_r[..frames], sr_f32);
+                let _ = player_tx.try_push(progress);
+                if player.target.is_none() {
+                    for f in 0..frames {
+                        master_l[f] += player_l[f];
+                        master_r[f] += player_r[f];
+                    }
+                }
+
+                // Détection Solo sur les tranches actives (Entrées + Aux actifs)
+                let mut any_solo = runtimes[..NUM_INPUT_STRIPS].iter().any(|r| r.solo);
+                if !any_solo {
+                    for p in 0..MAX_AUX_PAIRS {
+                        let base = NUM_INPUT_STRIPS + p * 2;
+                        if runtimes[base].solo || (!aux_pair_stereo[p] && runtimes[base + 1].solo) {
+                            any_solo = true;
+                            break;
+                        }
+                    }
+                }
                 let mut meters = [MeterFrame::default(); TOTAL_STRIPS];
 
-                // 2. Traitement des 8 tranches d'entrée UMC1820 (1..8)
+                // 2. Traitement des 8 tranches d'entrée avec sélecteur d'entrée physique
                 for ch in 0..NUM_INPUT_STRIPS {
                     let rt = &mut runtimes[ch];
                     let trim = db_to_linear(rt.gain_db);
+                    let add_player = player.target == Some(ch);
+
                     for f in 0..frames {
-                        let sample = if ch < in_channels {
-                            scratch_in[f * in_channels + ch] * trim
-                        } else {
-                            0.0
+                        let (mut in_l, mut in_r) = match rt.input_route {
+                            InputSourceRoute::None => (0.0, 0.0),
+                            InputSourceRoute::Mono(hw_ch) => {
+                                if hw_ch < in_channels {
+                                    let s = scratch_in[f * in_channels + hw_ch];
+                                    (s, s)
+                                } else {
+                                    (0.0, 0.0)
+                                }
+                            }
+                            InputSourceRoute::StereoPair(hw_ch) => {
+                                if hw_ch < in_channels {
+                                    let l = scratch_in[f * in_channels + hw_ch];
+                                    let r = if hw_ch + 1 < in_channels {
+                                        scratch_in[f * in_channels + hw_ch + 1]
+                                    } else {
+                                        l
+                                    };
+                                    (l, r)
+                                } else {
+                                    (0.0, 0.0)
+                                }
+                            }
                         };
-                        block_l[f] = sample;
-                        block_r[f] = sample;
+                        if add_player {
+                            in_l += player_l[f];
+                            in_r += player_r[f];
+                        }
+                        block_l[f] = in_l * trim;
+                        block_r[f] = in_r * trim;
                     }
 
-                    rt.inserts.process(&mut block_l[..frames], &mut block_r[..frames]);
+                    let n_midi =
+                        filter_midi_for_strip(rt.midi_mode, &midi_buf[..midi_count], &mut strip_midi);
+                    rt.inserts.process_with_midi(
+                        &mut block_l[..frames],
+                        &mut block_r[..frames],
+                        &strip_midi[..n_midi],
+                    );
 
                     let audible = if any_solo { rt.solo && !rt.mute } else { !rt.mute };
                     let fader = if audible { db_to_linear(rt.volume_db) } else { 0.0 };
@@ -283,48 +575,92 @@ pub fn start_audio_engine(preferred_device: Option<&str>) -> Result<AudioEngineH
                         block_r[f] = sr;
                         master_l[f] += sl;
                         master_r[f] += sr;
-                        for aux_i in 0..NUM_AUX_STRIPS {
-                            let send = rt.aux_sends[aux_i];
-                            aux_bus_l[aux_i][f] += sl * send;
-                            aux_bus_r[aux_i][f] += sr * send;
+
+                        for p in 0..MAX_AUX_PAIRS {
+                            let a_l = p * 2;
+                            let a_r = p * 2 + 1;
+                            if aux_pair_stereo[p] {
+                                let send = rt.aux_sends[a_l];
+                                aux_bus_l[a_l][f] += sl * send;
+                                aux_bus_r[a_l][f] += sr * send;
+                            } else {
+                                let mono = 0.5 * (sl + sr);
+                                let s_l = mono * rt.aux_sends[a_l];
+                                let s_r = mono * rt.aux_sends[a_r];
+                                aux_bus_l[a_l][f] += s_l;
+                                aux_bus_r[a_l][f] += s_l;
+                                aux_bus_l[a_r][f] += s_r;
+                                aux_bus_r[a_r][f] += s_r;
+                            }
                         }
                     }
 
                     meters[ch] = rt.meter.push_block(&block_l[..frames], &block_r[..frames], sr_f32);
                 }
 
-                // 3. Traitement des 4 sorties stéréo Aux (1/2, 3/4, 5/6, 7/8) — sans gain d'entrée
-                for aux_i in 0..NUM_AUX_STRIPS {
-                    let idx = NUM_INPUT_STRIPS + aux_i;
-                    let rt = &mut runtimes[idx];
-                    for f in 0..frames {
-                        block_l[f] = aux_bus_l[aux_i][f];
-                        block_r[f] = aux_bus_r[aux_i][f];
+                // 3. Traitement des bus Aux (Stéréo liés ou Mono séparés)
+                for p in 0..MAX_AUX_PAIRS {
+                    let sub_count = if aux_pair_stereo[p] { 1 } else { 2 };
+                    for sub in 0..sub_count {
+                        let aux_i = p * 2 + sub;
+                        let idx = NUM_INPUT_STRIPS + aux_i;
+                        let rt = &mut runtimes[idx];
+                        for f in 0..frames {
+                            block_l[f] = aux_bus_l[aux_i][f];
+                            block_r[f] = aux_bus_r[aux_i][f];
+                        }
+
+                        let n_midi = filter_midi_for_strip(
+                            rt.midi_mode,
+                            &midi_buf[..midi_count],
+                            &mut strip_midi,
+                        );
+                        rt.inserts.process_with_midi(
+                            &mut block_l[..frames],
+                            &mut block_r[..frames],
+                            &strip_midi[..n_midi],
+                        );
+
+                        let audible = if any_solo { rt.solo && !rt.mute } else { !rt.mute };
+                        let fader = if audible { db_to_linear(rt.volume_db) } else { 0.0 };
+
+                        for f in 0..frames {
+                            let (el, er) = rt.eq.process(block_l[f], block_r[f]);
+                            let ol = el * fader;
+                            let or = er * fader;
+                            if aux_pair_stereo[p] {
+                                aux_bus_l[aux_i][f] = ol;
+                                aux_bus_r[aux_i][f] = or;
+                            } else {
+                                let mono = 0.5 * (ol + or);
+                                aux_bus_l[aux_i][f] = mono;
+                                aux_bus_r[aux_i][f] = mono;
+                            }
+                            if rt.output_route == OutputTargetRoute::MasterBus {
+                                master_l[f] += aux_bus_l[aux_i][f];
+                                master_r[f] += aux_bus_r[aux_i][f];
+                            }
+                        }
+
+                        meters[idx] = rt.meter.push_block(
+                            &aux_bus_l[aux_i][..frames],
+                            &aux_bus_r[aux_i][..frames],
+                            sr_f32,
+                        );
                     }
-
-                    rt.inserts.process(&mut block_l[..frames], &mut block_r[..frames]);
-
-                    let audible = if any_solo { rt.solo && !rt.mute } else { !rt.mute };
-                    let fader = if audible { db_to_linear(rt.volume_db) } else { 0.0 };
-
-                    for f in 0..frames {
-                        let (el, er) = rt.eq.process(block_l[f], block_r[f]);
-                        aux_bus_l[aux_i][f] = el * fader;
-                        aux_bus_r[aux_i][f] = er * fader;
-                    }
-
-                    meters[idx] = rt.meter.push_block(
-                        &aux_bus_l[aux_i][..frames],
-                        &aux_bus_r[aux_i][..frames],
-                        sr_f32,
-                    );
                 }
 
                 // 4. Traitement de la tranche Master (SANS Gain et SANS Solo)
                 let master_idx = NUM_INPUT_STRIPS + NUM_AUX_STRIPS;
                 {
                     let rt = &mut runtimes[master_idx];
-                    rt.inserts.process(&mut master_l[..frames], &mut master_r[..frames]);
+                    let n_midi =
+                        filter_midi_for_strip(rt.midi_mode, &midi_buf[..midi_count], &mut strip_midi);
+                    rt.inserts.process_with_midi(
+                        &mut master_l[..frames],
+                        &mut master_r[..frames],
+                        &strip_midi[..n_midi],
+                    );
                     let fader = if !rt.mute { db_to_linear(rt.volume_db) } else { 0.0 };
 
                     for f in 0..frames {
@@ -339,22 +675,31 @@ pub fn start_audio_engine(preferred_device: Option<&str>) -> Result<AudioEngineH
                     );
                 }
 
-                // 5. Routage vers les sorties physiques UMC1820 (1/2, 3/4, 5/6, 7/8 + Main 9/10)
-                for f in 0..frames {
-                    let base = f * out_channels;
-                    if out_channels >= 10 {
-                        // Sorties 1-8 = 4 paires stéréo Aux, Sorties 9-10 = Main Out
-                        for aux_i in 0..4 {
-                            out[base + aux_i * 2] = aux_bus_l[aux_i][f];
-                            out[base + aux_i * 2 + 1] = aux_bus_r[aux_i][f];
-                        }
-                        out[base + 8] = master_l[f];
-                        out[base + 9] = master_r[f];
-                    } else if out_channels >= 2 {
-                        out[base] = master_l[f];
-                        out[base + 1] = master_r[f];
+                // 5. Routage dynamique vers les sorties physiques du périphérique audio
+                out[..frames * out_channels].fill(0.0);
+                for p in 0..MAX_AUX_PAIRS {
+                    let sub_count = if aux_pair_stereo[p] { 1 } else { 2 };
+                    for sub in 0..sub_count {
+                        let aux_i = p * 2 + sub;
+                        let idx = NUM_INPUT_STRIPS + aux_i;
+                        mix_to_hardware(
+                            runtimes[idx].output_route,
+                            &aux_bus_l[aux_i],
+                            &aux_bus_r[aux_i],
+                            out,
+                            frames,
+                            out_channels,
+                        );
                     }
                 }
+                mix_to_hardware(
+                    runtimes[master_idx].output_route,
+                    &master_l,
+                    &master_r,
+                    out,
+                    frames,
+                    out_channels,
+                );
 
                 let _ = meter_tx.try_push(meters);
             },
@@ -369,11 +714,16 @@ pub fn start_audio_engine(preferred_device: Option<&str>) -> Result<AudioEngineH
 
     Ok(AudioEngineHandle {
         command_tx: cmd_tx,
+        midi_tx: Some(midi_tx),
         meter_rx,
+        player_rx,
         retired_plugin_rx,
+        retired_track_rx,
         device_name,
         sample_rate,
         buffer_frames,
+        in_channels,
+        out_channels,
         _input_stream: input_stream,
         _output_stream: Some(output_stream),
     })
@@ -384,7 +734,16 @@ pub fn default_mixer_strips() -> Vec<StripState> {
     for i in 0..NUM_INPUT_STRIPS {
         strips.push(StripState::new(i, StripKind::Input, format!("IN {}", i + 1)));
     }
-    let aux_names = ["AUX 1/2", "AUX 3/4", "AUX 5/6", "AUX 7/8"];
+    let aux_names = [
+        "AUX 1/2",
+        "AUX 2",
+        "AUX 3/4",
+        "AUX 4",
+        "AUX 5/6",
+        "AUX 6",
+        "AUX 7/8",
+        "AUX 8",
+    ];
     for (idx, label) in aux_names.iter().enumerate() {
         strips.push(StripState::new(
             NUM_INPUT_STRIPS + idx,

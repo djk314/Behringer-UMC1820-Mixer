@@ -25,12 +25,18 @@ pub const K_NO_INTERFACE: i32 = -1;
 pub const K_NOT_IMPLEMENTED: i32 = 3;
 
 pub const K_MEDIA_AUDIO: i32 = 0;
+pub const K_MEDIA_EVENT: i32 = 1;
 pub const K_DIR_INPUT: i32 = 0;
 pub const K_DIR_OUTPUT: i32 = 1;
 pub const K_SAMPLE_32: i32 = 0;
 pub const K_REALTIME: i32 = 0;
 pub const K_SPEAKER_MONO: u64 = 0x1;
 pub const K_SPEAKER_STEREO: u64 = 0x3;
+
+pub const K_IS_LIVE: u16 = 1 << 0;
+pub const K_NOTE_ON_EVENT: u16 = 0;
+pub const K_NOTE_OFF_EVENT: u16 = 1;
+pub const K_POLY_PRESSURE_EVENT: u16 = 3;
 
 pub const IID_FUNKNOWN: [u8; 16] = tuid(0x00000000, 0x00000000, 0xC0000000, 0x00000046);
 pub const IID_IPLUGIN_BASE: [u8; 16] = tuid(0x22888DDB, 0x156E45AE, 0x8358B348, 0x08190625);
@@ -47,6 +53,8 @@ pub const IID_IRUN_LOOP: [u8; 16] = tuid(0x18C35366, 0x97764F1A, 0x9C5B8385, 0x7
 pub const IID_IBSTREAM: [u8; 16] = tuid(0xC3BF6EA2, 0x30994752, 0x9B6BF990, 0x1EE33E9B);
 pub const IID_IPARAMETER_CHANGES: [u8; 16] = tuid(0xA4779663, 0x0BB64A56, 0xB44384A8, 0x466FEB9D);
 pub const IID_IPARAM_VALUE_QUEUE: [u8; 16] = tuid(0x01263A18, 0xED074F6F, 0x98C9D356, 0x4686F9BA);
+pub const IID_IEVENT_LIST: [u8; 16] = tuid(0x3A2C4214, 0x346349FE, 0xB2C4F397, 0xB9695A44);
+pub const IID_IMIDI_MAPPING: [u8; 16] = tuid(0xDF0FF9F7, 0x49B74669, 0xB63AB732, 0x7ADBF5E5);
 
 #[inline]
 pub unsafe fn uid_eq(a: *const u8, b: &[u8; 16]) -> bool {
@@ -314,6 +322,93 @@ pub struct IParamValueQueueVtbl {
     pub get_point_count: unsafe extern "C" fn(*mut c_void) -> i32,
     pub get_point: unsafe extern "C" fn(*mut c_void, i32, *mut i32, *mut f64) -> i32,
     pub add_point: unsafe extern "C" fn(*mut c_void, i32, f64, *mut i32) -> i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Vst3NoteOnEvent {
+    pub channel: i16,
+    pub pitch: i16,
+    pub tuning: f32,
+    pub velocity: f32,
+    pub length: i32,
+    pub note_id: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Vst3NoteOffEvent {
+    pub channel: i16,
+    pub pitch: i16,
+    pub velocity: f32,
+    pub note_id: i32,
+    pub tuning: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Vst3PolyPressureEvent {
+    pub channel: i16,
+    pub pitch: i16,
+    pub pressure: f32,
+    pub note_id: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Vst3DataEvent {
+    pub size: u32,
+    pub kind: u32,
+    pub bytes: *const u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Vst3NoteExpressionValueEvent {
+    pub type_id: u32,
+    pub note_id: i32,
+    pub value: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union Vst3EventPayload {
+    pub note_on: Vst3NoteOnEvent,
+    pub note_off: Vst3NoteOffEvent,
+    pub poly_pressure: Vst3PolyPressureEvent,
+    pub data: Vst3DataEvent,
+    pub note_expression: Vst3NoteExpressionValueEvent,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Vst3Event {
+    pub bus_index: i32,
+    pub sample_offset: i32,
+    pub ppq_position: f64,
+    pub flags: u16,
+    pub typ: u16,
+    pub payload: Vst3EventPayload,
+}
+
+#[repr(C)]
+pub struct IEventListVtbl {
+    pub base: FUnknownVtbl,
+    pub get_event_count: unsafe extern "C" fn(*mut c_void) -> i32,
+    pub get_event: unsafe extern "C" fn(*mut c_void, i32, *mut Vst3Event) -> i32,
+    pub add_event: unsafe extern "C" fn(*mut c_void, *mut Vst3Event) -> i32,
+}
+
+#[repr(C)]
+pub struct IMidiMappingVtbl {
+    pub base: FUnknownVtbl,
+    pub get_midi_controller_assignment: unsafe extern "C" fn(
+        *mut c_void,
+        bus_index: i32,
+        channel: i16,
+        midi_controller_number: i16,
+        id: *mut u32,
+    ) -> i32,
 }
 
 // ---------- Implémentations côté hôte ----------
@@ -764,6 +859,83 @@ unsafe extern "C" fn pc_add_data(
     _index: *mut i32,
 ) -> *mut c_void {
     std::ptr::null_mut()
+}
+
+// ---------- HostEventList (événements MIDI NoteOn/NoteOff/PolyPressure -> VST3) ----------
+
+#[repr(C)]
+pub struct HostEventList {
+    vtbl: *const IEventListVtbl,
+    events: Vec<Vst3Event>,
+}
+
+static EVENT_LIST_VTBL: IEventListVtbl = IEventListVtbl {
+    base: FUnknownVtbl {
+        query_interface: el_qi,
+        add_ref: noop_ref,
+        release: noop_ref,
+    },
+    get_event_count: el_get_count,
+    get_event: el_get_event,
+    add_event: el_add_event,
+};
+
+impl HostEventList {
+    pub fn new() -> Self {
+        Self {
+            vtbl: &EVENT_LIST_VTBL,
+            events: Vec::with_capacity(128),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.events.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    pub fn push(&mut self, ev: Vst3Event) {
+        if self.events.len() < 128 {
+            self.events.push(ev);
+        }
+    }
+}
+
+unsafe extern "C" fn el_qi(this: *mut c_void, iid: *const u8, obj: *mut *mut c_void) -> i32 {
+    if obj.is_null() {
+        return K_NO_INTERFACE;
+    }
+    if uid_eq(iid, &IID_FUNKNOWN) || uid_eq(iid, &IID_IEVENT_LIST) {
+        *obj = this;
+        K_RESULT_OK
+    } else {
+        *obj = std::ptr::null_mut();
+        K_NO_INTERFACE
+    }
+}
+
+unsafe extern "C" fn el_get_count(this: *mut c_void) -> i32 {
+    (*(this as *const HostEventList)).events.len() as i32
+}
+
+unsafe extern "C" fn el_get_event(this: *mut c_void, index: i32, e: *mut Vst3Event) -> i32 {
+    let me = &*(this as *const HostEventList);
+    if e.is_null() || index < 0 || (index as usize) >= me.events.len() {
+        return K_RESULT_FALSE;
+    }
+    *e = me.events[index as usize];
+    K_RESULT_OK
+}
+
+unsafe extern "C" fn el_add_event(this: *mut c_void, e: *mut Vst3Event) -> i32 {
+    if e.is_null() {
+        return K_RESULT_FALSE;
+    }
+    let me = &mut *(this as *mut HostEventList);
+    me.push(*e);
+    K_RESULT_OK
 }
 
 // ---------- HostPlugFrame + IRunLoop (macOS & Linux GUI) ----------

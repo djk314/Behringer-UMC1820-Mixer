@@ -39,11 +39,6 @@ mod platform {
     #[link(name = "CoreAudioKit", kind = "framework")]
     extern "C" {}
 
-    #[link(name = "CoreFoundation", kind = "framework")]
-    extern "C" {
-        fn CFRelease(cf: *const c_void);
-    }
-
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default)]
     #[allow(dead_code)]

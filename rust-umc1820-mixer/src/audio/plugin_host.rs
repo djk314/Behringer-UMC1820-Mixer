@@ -1,12 +1,16 @@
 use super::state::{
-    DiscoveredPlugin, NativePluginHandle, PluginFormat, PluginParamDesc, MAX_INSERTS_PER_STRIP,
+    DiscoveredPlugin, MidiMessage, NativePluginHandle, PluginFormat, PluginParamDesc,
+    MAX_INSERTS_PER_STRIP,
 };
 use super::vst3_abi::{
     utf16_to_string, AudioBusBuffers, BusInfo, ComObj, HostApplication, HostBStream,
-    HostComponentHandler, HostParameterChanges, IAudioProcessorVtbl, IComponentVtbl,
-    IConnectionPointVtbl, IEditControllerVtbl, IPluginFactoryVtbl, PClassInfo, ParameterInfo,
-    ProcessData, ProcessSetup, IID_IAUDIO_PROCESSOR, IID_ICOMPONENT, IID_ICONNECTION_POINT,
-    IID_IEDIT_CONTROLLER, K_DIR_INPUT, K_DIR_OUTPUT, K_MEDIA_AUDIO, K_REALTIME, K_RESULT_OK,
+    HostComponentHandler, HostEventList, HostParameterChanges, IAudioProcessorVtbl,
+    IComponentVtbl, IConnectionPointVtbl, IEditControllerVtbl, IMidiMappingVtbl,
+    IPluginFactoryVtbl, PClassInfo, ParameterInfo, ProcessData, ProcessSetup, Vst3Event,
+    Vst3EventPayload, Vst3NoteOffEvent, Vst3NoteOnEvent, Vst3PolyPressureEvent,
+    IID_IAUDIO_PROCESSOR, IID_ICOMPONENT, IID_ICONNECTION_POINT, IID_IEDIT_CONTROLLER,
+    IID_IMIDI_MAPPING, K_DIR_INPUT, K_DIR_OUTPUT, K_IS_LIVE, K_MEDIA_AUDIO, K_MEDIA_EVENT,
+    K_NOTE_OFF_EVENT, K_NOTE_ON_EVENT, K_POLY_PRESSURE_EVENT, K_REALTIME, K_RESULT_OK,
     K_SAMPLE_32, K_SPEAKER_MONO, K_SPEAKER_STEREO,
 };
 use libloading::Library;
@@ -19,6 +23,7 @@ pub trait HostedPlugin: Send {
     fn name(&self) -> &str;
     fn format(&self) -> PluginFormat;
     fn prepare(&mut self, sample_rate: f32, max_block_size: usize);
+    fn process_midi(&mut self, _events: &[MidiMessage]) {}
     fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32]);
     fn set_bypassed(&mut self, bypassed: bool);
     fn parameters(&self) -> Vec<PluginParamDesc>;
@@ -57,12 +62,20 @@ impl StripInsertRack {
         }
     }
 
-    pub fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+    pub fn process_with_midi(
+        &mut self,
+        left: &mut [f32],
+        right: &mut [f32],
+        midi_events: &[MidiMessage],
+    ) {
         for i in 0..MAX_INSERTS_PER_STRIP {
             if self.bypassed[i] {
                 continue;
             }
             if let Some(plugin) = self.slots[i].as_mut() {
+                if !midi_events.is_empty() {
+                    plugin.process_midi(midi_events);
+                }
                 plugin.process_stereo(left, right);
             }
         }
@@ -127,7 +140,11 @@ fn scan_macos_audiounits(out: &mut Vec<DiscoveredPlugin>) {
     use coreaudio_sys::*;
     const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
     let mut seen_codes: Vec<[u32; 3]> = Vec::new();
-    let types = [u32::from_be_bytes(*b"aufx"), u32::from_be_bytes(*b"aumf")];
+    let types = [
+        u32::from_be_bytes(*b"aufx"),
+        u32::from_be_bytes(*b"aumf"),
+        u32::from_be_bytes(*b"aumu"),
+    ];
 
     unsafe {
         for comp_type in types {
@@ -418,6 +435,9 @@ pub struct Vst3PluginInstance {
     ctrl_cp: *mut ComObj<IConnectionPointVtbl>,
     pending_edits: Arc<Mutex<Vec<(u32, f64)>>>,
     param_changes: HostParameterChanges,
+    event_list: HostEventList,
+    midi_cc_map: Box<[[Option<u32>; 130]; 16]>,
+    midi_param_edits: Vec<(u32, f64)>,
     in_left: Vec<f32>,
     in_right: Vec<f32>,
     out_left: Vec<f32>,
@@ -566,7 +586,7 @@ impl Vst3PluginInstance {
                 }
             }
 
-            // Activation des bus audio principaux
+            // Activation des bus audio et événements MIDI principaux
             let in_buses = ((*(*comp).vtbl).get_bus_count)(comp as *mut c_void, K_MEDIA_AUDIO, K_DIR_INPUT);
             for b in 0..in_buses {
                 let mut bi: BusInfo = std::mem::zeroed();
@@ -581,20 +601,34 @@ impl Vst3PluginInstance {
                     let _ = ((*(*comp).vtbl).activate_bus)(comp as *mut c_void, K_MEDIA_AUDIO, K_DIR_OUTPUT, b, u8::from(b == 0));
                 }
             }
+            let event_in_buses = ((*(*comp).vtbl).get_bus_count)(comp as *mut c_void, K_MEDIA_EVENT, K_DIR_INPUT);
+            for b in 0..event_in_buses {
+                let _ = ((*(*comp).vtbl).activate_bus)(comp as *mut c_void, K_MEDIA_EVENT, K_DIR_INPUT, b, u8::from(b == 0));
+            }
 
             let mut in_arr = K_SPEAKER_STEREO;
             let mut out_arr = K_SPEAKER_STEREO;
-            if ((*(*proc).vtbl).set_bus_arrangements)(proc as *mut c_void, &mut in_arr, 1, &mut out_arr, 1)
-                != K_RESULT_OK
-            {
-                in_arr = K_SPEAKER_MONO;
-                out_arr = K_SPEAKER_STEREO;
+            if in_buses > 0 {
+                if ((*(*proc).vtbl).set_bus_arrangements)(proc as *mut c_void, &mut in_arr, 1, &mut out_arr, 1)
+                    != K_RESULT_OK
+                {
+                    in_arr = K_SPEAKER_MONO;
+                    out_arr = K_SPEAKER_STEREO;
+                    let _ = ((*(*proc).vtbl).set_bus_arrangements)(
+                        proc as *mut c_void,
+                        &mut in_arr,
+                        1,
+                        &mut out_arr,
+                        1,
+                    );
+                }
+            } else {
                 let _ = ((*(*proc).vtbl).set_bus_arrangements)(
                     proc as *mut c_void,
-                    &mut in_arr,
-                    1,
+                    std::ptr::null_mut(),
+                    0,
                     &mut out_arr,
-                    1,
+                    i32::from(out_buses > 0),
                 );
             }
 
@@ -685,6 +719,36 @@ impl Vst3PluginInstance {
                 }
             }
 
+            let mut midi_cc_map = Box::new([[None; 130]; 16]);
+            if !ctrl.is_null() {
+                let mut mm_void: *mut c_void = std::ptr::null_mut();
+                if ((*(*ctrl).vtbl).base.query_interface)(
+                    ctrl as *mut c_void,
+                    IID_IMIDI_MAPPING.as_ptr(),
+                    &mut mm_void,
+                ) == K_RESULT_OK
+                    && !mm_void.is_null()
+                {
+                    let mm = mm_void as *mut ComObj<IMidiMappingVtbl>;
+                    for ch in 0..16_i16 {
+                        for cc in 0..130_i16 {
+                            let mut param_id: u32 = 0;
+                            if ((*(*mm).vtbl).get_midi_controller_assignment)(
+                                mm as *mut c_void,
+                                0,
+                                ch,
+                                cc,
+                                &mut param_id,
+                            ) == K_RESULT_OK
+                            {
+                                midi_cc_map[ch as usize][cc as usize] = Some(param_id);
+                            }
+                        }
+                    }
+                    ((*(*mm).vtbl).base.release)(mm as *mut c_void);
+                }
+            }
+
             Ok(Self {
                 name: name.to_string(),
                 module,
@@ -699,6 +763,9 @@ impl Vst3PluginInstance {
                 ctrl_cp,
                 pending_edits,
                 param_changes: HostParameterChanges::new(),
+                event_list: HostEventList::new(),
+                midi_cc_map,
+                midi_param_edits: Vec::with_capacity(64),
                 in_left: vec![0.0_f32; 2048],
                 in_right: vec![0.0_f32; 2048],
                 out_left: vec![0.0_f32; 2048],
@@ -809,8 +876,109 @@ impl HostedPlugin for Vst3PluginInstance {
             }
         }
     }
+    fn process_midi(&mut self, events: &[MidiMessage]) {
+        if self.bypassed || self.proc.is_null() {
+            return;
+        }
+        for msg in events {
+            if msg.len == 0 {
+                continue;
+            }
+            let status = msg.bytes[0];
+            let cmd = status & 0xF0;
+            let ch = (status & 0x0F) as i16;
+            let d1 = msg.bytes[1] & 0x7F;
+            let d2 = msg.bytes[2] & 0x7F;
+            match cmd {
+                0x90 if msg.len >= 3 && d2 > 0 => {
+                    self.event_list.push(Vst3Event {
+                        bus_index: 0,
+                        sample_offset: 0,
+                        ppq_position: 0.0,
+                        flags: K_IS_LIVE,
+                        typ: K_NOTE_ON_EVENT,
+                        payload: Vst3EventPayload {
+                            note_on: Vst3NoteOnEvent {
+                                channel: ch,
+                                pitch: i16::from(d1),
+                                tuning: 0.0,
+                                velocity: f32::from(d2) / 127.0,
+                                length: 0,
+                                note_id: -1,
+                            },
+                        },
+                    });
+                }
+                0x80 | 0x90 if msg.len >= 2 => {
+                    let vel = if cmd == 0x80 && msg.len >= 3 {
+                        f32::from(d2) / 127.0
+                    } else {
+                        0.0
+                    };
+                    self.event_list.push(Vst3Event {
+                        bus_index: 0,
+                        sample_offset: 0,
+                        ppq_position: 0.0,
+                        flags: K_IS_LIVE,
+                        typ: K_NOTE_OFF_EVENT,
+                        payload: Vst3EventPayload {
+                            note_off: Vst3NoteOffEvent {
+                                channel: ch,
+                                pitch: i16::from(d1),
+                                velocity: vel,
+                                note_id: -1,
+                                tuning: 0.0,
+                            },
+                        },
+                    });
+                }
+                0xA0 if msg.len >= 3 => {
+                    self.event_list.push(Vst3Event {
+                        bus_index: 0,
+                        sample_offset: 0,
+                        ppq_position: 0.0,
+                        flags: K_IS_LIVE,
+                        typ: K_POLY_PRESSURE_EVENT,
+                        payload: Vst3EventPayload {
+                            poly_pressure: Vst3PolyPressureEvent {
+                                channel: ch,
+                                pitch: i16::from(d1),
+                                pressure: f32::from(d2) / 127.0,
+                                note_id: -1,
+                            },
+                        },
+                    });
+                }
+                0xB0 if msg.len >= 3 => {
+                    if let Some(pid) = self.midi_cc_map[ch as usize][d1 as usize] {
+                        if self.midi_param_edits.len() < 64 {
+                            self.midi_param_edits.push((pid, f64::from(d2) / 127.0));
+                        }
+                    }
+                }
+                0xD0 if msg.len >= 2 => {
+                    if let Some(pid) = self.midi_cc_map[ch as usize][128] {
+                        if self.midi_param_edits.len() < 64 {
+                            self.midi_param_edits.push((pid, f64::from(d1) / 127.0));
+                        }
+                    }
+                }
+                0xE0 if msg.len >= 3 => {
+                    if let Some(pid) = self.midi_cc_map[ch as usize][129] {
+                        let raw14 = (u16::from(d2) << 7) | u16::from(d1);
+                        if self.midi_param_edits.len() < 64 {
+                            self.midi_param_edits.push((pid, f64::from(raw14) / 16383.0));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32]) {
         if self.bypassed || self.proc.is_null() {
+            self.event_list.clear();
+            self.midi_param_edits.clear();
             return;
         }
         let frames = left.len().min(right.len()).min(2048);
@@ -824,14 +992,19 @@ impl HostedPlugin for Vst3PluginInstance {
                 self.param_changes.push(id, norm);
             }
         }
+        for (id, norm) in self.midi_param_edits.drain(..) {
+            self.param_changes.push(id, norm);
+        }
 
-        if self.in_channels == 1 {
-            for i in 0..frames {
-                self.in_left[i] = 0.5 * (left[i] + right[i]);
+        if self.has_input_bus {
+            if self.in_channels == 1 {
+                for i in 0..frames {
+                    self.in_left[i] = 0.5 * (left[i] + right[i]);
+                }
+            } else {
+                self.in_left[..frames].copy_from_slice(&left[..frames]);
+                self.in_right[..frames].copy_from_slice(&right[..frames]);
             }
-        } else {
-            self.in_left[..frames].copy_from_slice(&left[..frames]);
-            self.in_right[..frames].copy_from_slice(&right[..frames]);
         }
         self.out_left[..frames].fill(0.0);
         self.out_right[..frames].fill(0.0);
@@ -849,6 +1022,11 @@ impl HostedPlugin for Vst3PluginInstance {
             silence_flags: 0,
             channel_buffers32: out_ptrs.as_mut_ptr(),
         };
+        let input_events_ptr = if self.event_list.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            &mut self.event_list as *mut HostEventList as *mut c_void
+        };
         let mut data = ProcessData {
             process_mode: K_REALTIME,
             symbolic_sample_size: K_SAMPLE_32,
@@ -859,12 +1037,13 @@ impl HostedPlugin for Vst3PluginInstance {
             outputs: &mut out_bus,
             input_parameter_changes: &mut self.param_changes as *mut HostParameterChanges as *mut c_void,
             output_parameter_changes: std::ptr::null_mut(),
-            input_events: std::ptr::null_mut(),
+            input_events: input_events_ptr,
             output_events: std::ptr::null_mut(),
             process_context: std::ptr::null_mut(),
         };
 
         let status = unsafe { ((*(*self.proc).vtbl).process)(self.proc as *mut c_void, &mut data) };
+        self.event_list.clear();
         if status == K_RESULT_OK {
             left[..frames].copy_from_slice(&self.out_left[..frames]);
             if self.out_channels == 1 {
@@ -888,6 +1067,7 @@ pub const VST2_EFF_EDIT_GET_RECT: i32 = 13;
 pub const VST2_EFF_EDIT_OPEN: i32 = 14;
 pub const VST2_EFF_EDIT_CLOSE: i32 = 15;
 pub const VST2_EFF_EDIT_IDLE: i32 = 19;
+const VST2_EFF_PROCESS_EVENTS: i32 = 25;
 const VST2_FLAGS_HAS_EDITOR: i32 = 1 << 0;
 
 #[repr(C)]
@@ -1031,7 +1211,12 @@ unsafe extern "C" fn vst2_host_callback(
             }
             let req = CStr::from_ptr(ptr as *const std::ffi::c_char).to_string_lossy();
             match req.as_ref() {
-                "sizeWindow" | "supplyIdle" | "sendVstTimeInfo" | "acceptIOChanges" => 1,
+                "sizeWindow"
+                | "supplyIdle"
+                | "sendVstTimeInfo"
+                | "acceptIOChanges"
+                | "receiveVstEvents"
+                | "receiveVstMidiEvent" => 1,
                 _ => 0,
             }
         }
@@ -1040,7 +1225,60 @@ unsafe extern "C" fn vst2_host_callback(
     }
 }
 
-/// Hôte VST2 C-ABI complet (AEffect + processReplacing + éditeur natif effEditOpen).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct Vst2MidiEvent {
+    ty: i32,
+    byte_size: i32,
+    delta_frames: i32,
+    flags: i32,
+    note_length: i32,
+    note_offset: i32,
+    midi_data: [u8; 4],
+    detune: i8,
+    note_off_velocity: u8,
+    reserved1: u8,
+    reserved2: u8,
+}
+
+impl Default for Vst2MidiEvent {
+    fn default() -> Self {
+        Self {
+            ty: 1,
+            byte_size: std::mem::size_of::<Self>() as i32,
+            delta_frames: 0,
+            flags: 1,
+            note_length: 0,
+            note_offset: 0,
+            midi_data: [0; 4],
+            detune: 0,
+            note_off_velocity: 0,
+            reserved1: 0,
+            reserved2: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+struct Vst2EventsBlock {
+    num_events: i32,
+    reserved: isize,
+    events: [*mut Vst2MidiEvent; 64],
+}
+
+impl Default for Vst2EventsBlock {
+    fn default() -> Self {
+        Self {
+            num_events: 0,
+            reserved: 0,
+            events: [std::ptr::null_mut(); 64],
+        }
+    }
+}
+
+/// Hôte VST2 C-ABI complet (AEffect + processReplacing + MIDI effProcessEvents + éditeur natif).
 pub struct Vst2PluginInstance {
     name: String,
     _lib: Library,
@@ -1053,6 +1291,8 @@ pub struct Vst2PluginInstance {
     out_left: Vec<f32>,
     out_right: Vec<f32>,
     out_scratch: Vec<f32>,
+    midi_events: [Vst2MidiEvent; 64],
+    midi_block: Vst2EventsBlock,
     bypassed: bool,
     params: Vec<PluginParamDesc>,
 }
@@ -1149,6 +1389,8 @@ impl Vst2PluginInstance {
                 out_left: vec![0.0_f32; 2048],
                 out_right: vec![0.0_f32; 2048],
                 out_scratch: vec![0.0_f32; 2048],
+                midi_events: [Vst2MidiEvent::default(); 64],
+                midi_block: Vst2EventsBlock::default(),
                 bypassed: false,
                 params,
             })
@@ -1265,8 +1507,33 @@ impl HostedPlugin for Vst2PluginInstance {
             }
         }
     }
+    fn process_midi(&mut self, events: &[MidiMessage]) {
+        if self.bypassed || self.effect.is_null() {
+            return;
+        }
+        for msg in events {
+            let idx = self.midi_block.num_events as usize;
+            if idx >= self.midi_events.len() {
+                break;
+            }
+            if msg.len == 0 {
+                continue;
+            }
+            let mut ev = Vst2MidiEvent::default();
+            ev.midi_data[0] = msg.bytes[0];
+            if msg.len >= 2 {
+                ev.midi_data[1] = msg.bytes[1];
+            }
+            if msg.len >= 3 {
+                ev.midi_data[2] = msg.bytes[2];
+            }
+            self.midi_events[idx] = ev;
+            self.midi_block.num_events += 1;
+        }
+    }
     fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32]) {
         if self.bypassed || self.effect.is_null() {
+            self.midi_block.num_events = 0;
             return;
         }
         let frames = left.len().min(right.len()).min(2048);
@@ -1278,7 +1545,7 @@ impl HostedPlugin for Vst2PluginInstance {
             for i in 0..frames {
                 self.in_left[i] = 0.5 * (left[i] + right[i]);
             }
-        } else {
+        } else if self.num_inputs >= 2 {
             self.in_left[..frames].copy_from_slice(&left[..frames]);
             self.in_right[..frames].copy_from_slice(&right[..frames]);
         }
@@ -1304,6 +1571,21 @@ impl HostedPlugin for Vst2PluginInstance {
         }
 
         unsafe {
+            let ev_count = self.midi_block.num_events.clamp(0, 64) as usize;
+            if ev_count > 0 {
+                for i in 0..ev_count {
+                    self.midi_block.events[i] = &mut self.midi_events[i] as *mut Vst2MidiEvent;
+                }
+                ((*self.effect).dispatcher)(
+                    self.effect,
+                    VST2_EFF_PROCESS_EVENTS,
+                    0,
+                    0,
+                    &mut self.midi_block as *mut Vst2EventsBlock as *mut c_void,
+                    0.0,
+                );
+                self.midi_block.num_events = 0;
+            }
             ((*self.effect).process_replacing)(
                 self.effect,
                 in_ptrs.as_mut_ptr(),
@@ -1379,10 +1661,23 @@ unsafe extern "C" fn au_input_render_callback(
 }
 
 #[cfg(target_os = "macos")]
+#[link(name = "AudioToolbox", kind = "framework")]
+extern "C" {
+    fn MusicDeviceMIDIEvent(
+        in_unit: coreaudio_sys::AudioComponentInstance,
+        in_status: u32,
+        in_data1: u32,
+        in_data2: u32,
+        in_offset_sample_frame: u32,
+    ) -> coreaudio_sys::OSStatus;
+}
+
+#[cfg(target_os = "macos")]
 pub struct AudioUnitInstance {
     name: String,
     unit: coreaudio_sys::AudioComponentInstance,
     input_scratch: *mut AuInputScratch,
+    has_input_bus: bool,
     in_channels: usize,
     out_channels: usize,
     out_left: Vec<f32>,
@@ -1400,6 +1695,7 @@ impl AudioUnitInstance {
     unsafe fn configure_stream_format(
         unit: coreaudio_sys::AudioComponentInstance,
         sample_rate: f64,
+        has_input_bus: bool,
     ) -> (usize, usize) {
         use coreaudio_sys::*;
         let make_asbd = |channels: u32| AudioStreamBasicDescription {
@@ -1417,24 +1713,25 @@ impl AudioUnitInstance {
         let stereo = make_asbd(2);
         let mono = make_asbd(1);
 
-        let mut in_ch = 2_usize;
-        if AudioUnitSetProperty(
-            unit,
-            kAudioUnitProperty_StreamFormat,
-            kAudioUnitScope_Input,
-            0,
-            &stereo as *const _ as *const c_void,
-            asbd_sz,
-        ) != 0
-        {
+        let mut in_ch = 0_usize;
+        if has_input_bus {
+            in_ch = 2;
             if AudioUnitSetProperty(
                 unit,
                 kAudioUnitProperty_StreamFormat,
                 kAudioUnitScope_Input,
                 0,
-                &mono as *const _ as *const c_void,
+                &stereo as *const _ as *const c_void,
                 asbd_sz,
-            ) == 0
+            ) != 0
+                && AudioUnitSetProperty(
+                    unit,
+                    kAudioUnitProperty_StreamFormat,
+                    kAudioUnitScope_Input,
+                    0,
+                    &mono as *const _ as *const c_void,
+                    asbd_sz,
+                ) == 0
             {
                 in_ch = 1;
             }
@@ -1498,20 +1795,33 @@ impl AudioUnitInstance {
                 &max_frames as *const UInt32 as *const c_void,
                 std::mem::size_of::<UInt32>() as UInt32,
             );
-            let (in_channels, out_channels) = Self::configure_stream_format(unit, 48000.0);
-
-            let cb = AURenderCallbackStruct {
-                inputProc: Some(au_input_render_callback),
-                inputProcRefCon: input_scratch as *mut c_void,
-            };
-            let _ = AudioUnitSetProperty(
+            let mut in_prop_sz: UInt32 = 0;
+            let mut in_writable: Boolean = 0;
+            let has_input_bus = AudioUnitGetPropertyInfo(
                 unit,
-                kAudioUnitProperty_SetRenderCallback,
+                kAudioUnitProperty_StreamFormat,
                 kAudioUnitScope_Input,
                 0,
-                &cb as *const _ as *const c_void,
-                std::mem::size_of::<AURenderCallbackStruct>() as UInt32,
-            );
+                &mut in_prop_sz,
+                &mut in_writable,
+            ) == 0;
+            let (in_channels, out_channels) =
+                Self::configure_stream_format(unit, 48000.0, has_input_bus);
+
+            if has_input_bus {
+                let cb = AURenderCallbackStruct {
+                    inputProc: Some(au_input_render_callback),
+                    inputProcRefCon: input_scratch as *mut c_void,
+                };
+                let _ = AudioUnitSetProperty(
+                    unit,
+                    kAudioUnitProperty_SetRenderCallback,
+                    kAudioUnitScope_Input,
+                    0,
+                    &cb as *const _ as *const c_void,
+                    std::mem::size_of::<AURenderCallbackStruct>() as UInt32,
+                );
+            }
 
             AudioUnitInitialize(unit);
 
@@ -1582,6 +1892,7 @@ impl AudioUnitInstance {
                 name: desc.name.clone(),
                 unit,
                 input_scratch,
+                has_input_bus,
                 in_channels,
                 out_channels,
                 out_left: vec![0.0_f32; 2048],
@@ -1625,7 +1936,8 @@ impl HostedPlugin for AudioUnitInstance {
     fn prepare(&mut self, sample_rate: f32, _max_block_size: usize) {
         unsafe {
             coreaudio_sys::AudioUnitUninitialize(self.unit);
-            let (in_ch, out_ch) = Self::configure_stream_format(self.unit, f64::from(sample_rate));
+            let (in_ch, out_ch) =
+                Self::configure_stream_format(self.unit, f64::from(sample_rate), self.has_input_bus);
             self.in_channels = in_ch;
             self.out_channels = out_ch;
             coreaudio_sys::AudioUnitInitialize(self.unit);
@@ -1652,8 +1964,24 @@ impl HostedPlugin for AudioUnitInstance {
             );
         }
     }
+    fn process_midi(&mut self, events: &[MidiMessage]) {
+        if self.bypassed || self.unit.is_null() {
+            return;
+        }
+        for msg in events {
+            if msg.len == 0 {
+                continue;
+            }
+            let b0 = u32::from(msg.bytes[0]);
+            let b1 = if msg.len >= 2 { u32::from(msg.bytes[1]) } else { 0 };
+            let b2 = if msg.len >= 3 { u32::from(msg.bytes[2]) } else { 0 };
+            unsafe {
+                let _ = MusicDeviceMIDIEvent(self.unit, b0, b1, b2, 0);
+            }
+        }
+    }
     fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32]) {
-        if self.bypassed || self.input_scratch.is_null() {
+        if self.bypassed || self.unit.is_null() {
             return;
         }
         let frames = left.len().min(right.len()).min(2048);
@@ -1661,17 +1989,21 @@ impl HostedPlugin for AudioUnitInstance {
             return;
         }
         unsafe {
-            let scratch = &mut *self.input_scratch;
-            if self.in_channels == 1 {
-                for i in 0..frames {
-                    scratch.left[i] = 0.5 * (left[i] + right[i]);
+            if self.has_input_bus && !self.input_scratch.is_null() {
+                let scratch = &mut *self.input_scratch;
+                if self.in_channels == 1 {
+                    for i in 0..frames {
+                        scratch.left[i] = 0.5 * (left[i] + right[i]);
+                    }
+                } else {
+                    scratch.left[..frames].copy_from_slice(&left[..frames]);
+                    scratch.right[..frames].copy_from_slice(&right[..frames]);
                 }
-            } else {
-                scratch.left[..frames].copy_from_slice(&left[..frames]);
-                scratch.right[..frames].copy_from_slice(&right[..frames]);
+                scratch.available_frames = frames;
             }
-            scratch.available_frames = frames;
 
+            self.out_left[..frames].fill(0.0);
+            self.out_right[..frames].fill(0.0);
             let byte_sz = (frames * std::mem::size_of::<f32>()) as u32;
             let mut abl = StereoAudioBufferList {
                 m_number_buffers: self.out_channels as u32,

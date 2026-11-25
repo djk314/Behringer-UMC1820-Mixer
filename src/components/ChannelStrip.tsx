@@ -1,11 +1,17 @@
 import React from 'react';
-import { Power, Plus, X } from 'lucide-react';
+import { Power, Plus, Split, X } from 'lucide-react';
 import {
-  AUX_LABELS,
+  AuxPairStereoState,
+  AuxSendsTuple,
+  HardwareInputRoute,
+  HardwareOutputRoute,
   InputSourceKind,
+  MAX_AUX_PAIRS,
   MAX_INSERTS_PER_STRIP,
   MeterLevel,
   StripState,
+  formatInputRouteLabel,
+  formatOutputRouteLabel,
 } from '../types/mixer';
 import { Fader } from './Fader';
 import { RotaryKnob } from './RotaryKnob';
@@ -15,6 +21,9 @@ interface ChannelStripProps {
   strip: StripState;
   meter: MeterLevel;
   anySoloActive: boolean;
+  auxPairStereo: AuxPairStereoState;
+  hardwareChannels?: { in: number; out: number };
+  onToggleAuxPair?: (pairIndex: number) => void;
   onUpdate: (stripId: string, updater: (prev: StripState) => StripState) => void;
   onOpenInsertModal: (stripId: string, slotIndex: number) => void;
 }
@@ -30,10 +39,39 @@ const SOURCE_OPTIONS: { value: InputSourceKind; label: string }[] = [
   { value: 'microphone', label: 'Microphone Live' },
 ];
 
+function serializeInputRoute(route: HardwareInputRoute): string {
+  if (route.kind === 'none') return 'none';
+  return `${route.kind}:${route.channel}`;
+}
+
+function parseInputRoute(encoded: string): HardwareInputRoute {
+  if (encoded === 'none') return { kind: 'none' };
+  const [kind, chStr] = encoded.split(':');
+  const channel = Number(chStr) || 0;
+  return kind === 'stereo' ? { kind: 'stereo', channel } : { kind: 'mono', channel };
+}
+
+function serializeOutputRoute(route: HardwareOutputRoute): string {
+  if (route.kind === 'none') return 'none';
+  if (route.kind === 'master') return 'master';
+  return `${route.kind}:${route.channel}`;
+}
+
+function parseOutputRoute(encoded: string): HardwareOutputRoute {
+  if (encoded === 'none') return { kind: 'none' };
+  if (encoded === 'master') return { kind: 'master' };
+  const [kind, chStr] = encoded.split(':');
+  const channel = Number(chStr) || 0;
+  return kind === 'stereo' ? { kind: 'stereo', channel } : { kind: 'mono', channel };
+}
+
 export const ChannelStrip: React.FC<ChannelStripProps> = ({
   strip,
   meter,
   anySoloActive,
+  auxPairStereo,
+  hardwareChannels = { in: 8, out: 10 },
+  onToggleAuxPair,
   onUpdate,
   onOpenInsertModal,
 }) => {
@@ -42,6 +80,8 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
   const isInput = strip.kind === 'input';
 
   const isDimmedBySolo = !isMaster && anySoloActive && !strip.solo;
+  const pairIndex = isAux ? Math.floor((strip.index - 8) / 2) : -1;
+  const isAuxStereo = isAux && pairIndex >= 0 && auxPairStereo[pairIndex];
 
   const stripBg = isMaster
     ? 'bg-[#19161D] border-amber-500/30'
@@ -51,10 +91,26 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
 
   const activeInsertCount = strip.inserts.filter((s) => s.plugin !== null).length;
 
+  const inChannelCount = Math.max(2, hardwareChannels.in);
+  const outChannelCount = Math.max(2, hardwareChannels.out);
+
+  // Build visible auxiliary send knobs according to each pair's Stereo / Split Mono mode
+  const activeAuxSends: { auxIdx: number; label: string }[] = [];
+  for (let p = 0; p < MAX_AUX_PAIRS; p++) {
+    const ch1 = p * 2 + 1;
+    const ch2 = p * 2 + 2;
+    if (auxPairStereo[p]) {
+      activeAuxSends.push({ auxIdx: p * 2, label: `A ${ch1}/${ch2}` });
+    } else {
+      activeAuxSends.push({ auxIdx: p * 2, label: `A ${ch1}` });
+      activeAuxSends.push({ auxIdx: p * 2 + 1, label: `A ${ch2}` });
+    }
+  }
+
   return (
     <section
       aria-label={`Tranche ${strip.name}`}
-      className={`flex flex-col w-[132px] shrink-0 border rounded-md p-2.5 gap-2 transition-opacity ${stripBg} ${
+      className={`flex flex-col w-[138px] shrink-0 border rounded-md p-2.5 gap-2 transition-opacity ${stripBg} ${
         isDimmedBySolo ? 'opacity-65' : 'opacity-100'
       }`}
     >
@@ -77,28 +133,118 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
         </div>
       </div>
 
-      {/* Input Source Selector (Input strips only, for live browser audio routing) */}
+      {/* Top Hardware I/O Selector (every strip — adapts to any soundcard) */}
       {isInput ? (
-        <select
-          aria-label={`Source audio ${strip.name}`}
-          value={strip.source}
-          onChange={(e) =>
-            onUpdate(strip.id, (s) => ({
-              ...s,
-              source: e.target.value as InputSourceKind,
-            }))
-          }
-          className="w-full bg-[#0B0E14] border border-[#232936] rounded px-1.5 py-1 text-[10px] text-slate-300 focus:outline-none focus:border-sky-500 truncate"
-        >
-          {SOURCE_OPTIONS.map((opt) => (
-            <option key={opt.value} value={opt.value}>
-              {opt.label}
-            </option>
-          ))}
-        </select>
+        <div className="flex flex-col gap-1">
+          <select
+            aria-label={`Entrée matérielle ${strip.name}`}
+            value={serializeInputRoute(strip.inputRoute)}
+            onChange={(e) => {
+              const nextRoute = parseInputRoute(e.target.value);
+              onUpdate(strip.id, (s) => ({
+                ...s,
+                inputRoute: nextRoute,
+                hardwareChannelLabel: formatInputRouteLabel(nextRoute),
+              }));
+            }}
+            className="w-full bg-[#0B0E14] border border-amber-500/30 rounded px-1.5 py-1 text-[10px] text-amber-200 focus:outline-none focus:border-amber-400 truncate"
+            title="Sélecteur d'entrée physique (carte son)"
+          >
+            <option value="none">Entrée : Aucune</option>
+            {Array.from({ length: inChannelCount }, (_, ch) => (
+              <option key={`in-m-${ch}`} value={`mono:${ch}`}>
+                In {ch + 1} (Mono)
+              </option>
+            ))}
+            {Array.from({ length: Math.floor(inChannelCount / 2) }, (_, pair) => {
+              const ch = pair * 2;
+              return (
+                <option key={`in-s-${ch}`} value={`stereo:${ch}`}>
+                  In {ch + 1}/{ch + 2} (Stéréo)
+                </option>
+              );
+            })}
+          </select>
+
+          <select
+            aria-label={`Source audio ${strip.name}`}
+            value={strip.source}
+            onChange={(e) =>
+              onUpdate(strip.id, (s) => ({
+                ...s,
+                source: e.target.value as InputSourceKind,
+              }))
+            }
+            className="w-full bg-[#0B0E14] border border-[#232936] rounded px-1.5 py-1 text-[10px] text-slate-300 focus:outline-none focus:border-sky-500 truncate"
+            title="Source de test Web Audio"
+          >
+            {SOURCE_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
+        </div>
       ) : (
-        <div className="h-[24px] flex items-center justify-center text-[10px] font-mono text-slate-400 bg-[#0B0E14]/60 border border-[#232936]/70 rounded">
-          {isMaster ? 'Sortie Principale' : 'Bus Stéréo'}
+        <div className="flex flex-col gap-1">
+          <select
+            aria-label={`Sortie matérielle ${strip.name}`}
+            value={serializeOutputRoute(strip.outputRoute)}
+            onChange={(e) => {
+              const nextRoute = parseOutputRoute(e.target.value);
+              onUpdate(strip.id, (s) => ({
+                ...s,
+                outputRoute: nextRoute,
+                hardwareChannelLabel: formatOutputRouteLabel(nextRoute),
+              }));
+            }}
+            className={`w-full bg-[#0B0E14] rounded px-1.5 py-1 text-[10px] focus:outline-none truncate border ${
+              isMaster
+                ? 'border-amber-500/35 text-amber-200 focus:border-amber-400'
+                : 'border-sky-500/35 text-sky-200 focus:border-sky-400'
+            }`}
+            title="Sélecteur de sortie physique (carte son)"
+          >
+            <option value="none">Sortie : Aucune</option>
+            {isAux && <option value="master">Vers Master</option>}
+            {Array.from({ length: Math.floor(outChannelCount / 2) }, (_, pair) => {
+              const ch = pair * 2;
+              return (
+                <option key={`out-s-${ch}`} value={`stereo:${ch}`}>
+                  Out {ch + 1}/{ch + 2} (Stéréo)
+                </option>
+              );
+            })}
+            {Array.from({ length: outChannelCount }, (_, ch) => (
+              <option key={`out-m-${ch}`} value={`mono:${ch}`}>
+                Out {ch + 1} (Mono)
+              </option>
+            ))}
+          </select>
+
+          {isAux && onToggleAuxPair ? (
+            <button
+              type="button"
+              onClick={() => onToggleAuxPair(pairIndex)}
+              className={`flex items-center justify-center gap-1 w-full rounded px-1.5 py-1 text-[10px] font-medium border cursor-pointer transition-colors ${
+                isAuxStereo
+                  ? 'bg-sky-500/15 border-sky-500/40 text-sky-300 hover:bg-sky-500/25'
+                  : 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25'
+              }`}
+              title={
+                isAuxStereo
+                  ? 'Séparer cette paire en 2 bus Mono indépendants'
+                  : 'Recombiner en 1 bus Stéréo'
+              }
+            >
+              <Split className="w-2.5 h-2.5 shrink-0" />
+              <span>{isAuxStereo ? 'Stéréo → Mono' : 'Mono → Stéréo'}</span>
+            </button>
+          ) : (
+            <div className="h-[24px] flex items-center justify-center text-[10px] font-mono text-amber-300/90 bg-[#0B0E14]/60 border border-[#232936]/70 rounded">
+              Sortie Principale
+            </div>
+          )}
         </div>
       )}
 
@@ -119,9 +265,13 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
             }
           />
         ) : (
-          <div className="h-[60px] flex flex-col items-center justify-center text-center px-1">
+          <div className="h-[52px] flex flex-col items-center justify-center text-center px-1">
             <span className="text-[10px] font-medium text-slate-400">
-              {isMaster ? 'Bus Master' : 'Bus Aux Stéréo'}
+              {isMaster
+                ? 'Bus Master'
+                : isAuxStereo
+                  ? 'Bus Aux Stéréo'
+                  : 'Bus Aux Mono'}
             </span>
             <span className="text-[10px] font-mono text-slate-500">
               {isMaster ? 'Sans Gain / Solo' : 'Sans Gain'}
@@ -236,10 +386,10 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
         </div>
       </div>
 
-      {/* 4-Band Rotary EQ */}
+      {/* 5-Band Rotary EQ (with 5th Mid 1 kHz knob centered in the middle) */}
       <div className="flex flex-col gap-1.5 border-b border-[#232936] pb-2">
         <div className="flex items-center justify-between px-0.5">
-          <span className="text-[10px] font-medium text-slate-400">EQ 4 Bandes</span>
+          <span className="text-[10px] font-medium text-slate-400">EQ 5 Bandes</span>
           <button
             type="button"
             onClick={() =>
@@ -258,7 +408,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
           </button>
         </div>
 
-        <div className="grid grid-cols-2 gap-y-1.5 gap-x-1 place-items-center">
+        <div className="grid grid-cols-2 gap-y-1 gap-x-1 place-items-center">
           <RotaryKnob
             label="HI 10k"
             value={strip.eq.highGainDb}
@@ -266,7 +416,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
             max={15}
             defaultValue={0}
             accentColor={strip.eq.bypassed ? '#475569' : '#38BDF8'}
-            size={32}
+            size={30}
             onChange={(val) =>
               onUpdate(strip.id, (s) => ({
                 ...s,
@@ -281,7 +431,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
             max={15}
             defaultValue={0}
             accentColor={strip.eq.bypassed ? '#475569' : '#38BDF8'}
-            size={32}
+            size={30}
             onChange={(val) =>
               onUpdate(strip.id, (s) => ({
                 ...s,
@@ -289,6 +439,28 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
               }))
             }
           />
+        </div>
+
+        {/* 5th EQ knob (Mid 1 kHz) centered */}
+        <div className="flex justify-center">
+          <RotaryKnob
+            label="MID 1k"
+            value={strip.eq.midGainDb}
+            min={-15}
+            max={15}
+            defaultValue={0}
+            accentColor={strip.eq.bypassed ? '#475569' : '#7DD3FC'}
+            size={32}
+            onChange={(val) =>
+              onUpdate(strip.id, (s) => ({
+                ...s,
+                eq: { ...s.eq, midGainDb: val },
+              }))
+            }
+          />
+        </div>
+
+        <div className="grid grid-cols-2 gap-y-1 gap-x-1 place-items-center">
           <RotaryKnob
             label="LM 400"
             value={strip.eq.lowMidGainDb}
@@ -296,7 +468,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
             max={15}
             defaultValue={0}
             accentColor={strip.eq.bypassed ? '#475569' : '#38BDF8'}
-            size={32}
+            size={30}
             onChange={(val) =>
               onUpdate(strip.id, (s) => ({
                 ...s,
@@ -311,7 +483,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
             max={15}
             defaultValue={0}
             accentColor={strip.eq.bypassed ? '#475569' : '#38BDF8'}
-            size={32}
+            size={30}
             onChange={(val) =>
               onUpdate(strip.id, (s) => ({
                 ...s,
@@ -322,18 +494,18 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
         </div>
       </div>
 
-      {/* 4 Auxiliary Rotary Sends — OMITTED ON MASTER STRIP */}
+      {/* Dynamic Auxiliary Rotary Sends (4 Stereo or up to 8 Mono) — OMITTED ON MASTER STRIP */}
       {!isMaster ? (
         <div className="flex flex-col gap-1.5 border-b border-[#232936] pb-2">
           <span className="text-[10px] font-medium text-slate-400 px-0.5">
-            Envois Auxiliaires
+            Envois Aux ({activeAuxSends.length})
           </span>
           <div className="grid grid-cols-2 gap-y-1.5 gap-x-1 place-items-center">
-            {AUX_LABELS.map((auxLabel, auxIdx) => (
+            {activeAuxSends.map((sendItem) => (
               <RotaryKnob
-                key={auxLabel}
-                label={auxLabel.replace('Aux ', 'A ')}
-                value={strip.auxSends[auxIdx]}
+                key={`${strip.id}-aux-${sendItem.auxIdx}`}
+                label={sendItem.label}
+                value={strip.auxSends[sendItem.auxIdx] ?? 0}
                 min={0}
                 max={100}
                 defaultValue={0}
@@ -343,13 +515,8 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 size={30}
                 onChange={(val) =>
                   onUpdate(strip.id, (s) => {
-                    const nextAux: [number, number, number, number] = [...s.auxSends] as [
-                      number,
-                      number,
-                      number,
-                      number,
-                    ];
-                    nextAux[auxIdx] = val;
+                    const nextAux = [...s.auxSends] as AuxSendsTuple;
+                    nextAux[sendItem.auxIdx] = val;
                     return { ...s, auxSends: nextAux };
                   })
                 }

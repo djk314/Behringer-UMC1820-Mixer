@@ -1,16 +1,22 @@
 use crate::audio::engine::{
     default_mixer_strips, list_audio_devices, start_audio_engine, AudioEngineHandle,
 };
+use crate::audio::midi::{MidiInputManager, MidiPortSelection};
+use crate::audio::player::decode_audio_file;
 use crate::audio::plugin_host::{instantiate_plugin, scan_system_plugins, HostedPlugin};
 use crate::audio::state::{
-    DiscoveredPlugin, MeterFrame, MixerCommand, NativePluginHandle, PluginFormat, StripKind,
-    StripState, MAX_INSERTS_PER_STRIP, NUM_AUX_STRIPS, NUM_INPUT_STRIPS, TOTAL_STRIPS,
+    DiscoveredPlugin, InputSourceRoute, MeterFrame, MixerCommand, MixerSetFile, NativePluginHandle,
+    OutputTargetRoute, PlayerProgress, PluginFormat, StripKind, StripState, MAX_AUX_PAIRS,
+    MAX_INSERTS_PER_STRIP, NUM_AUX_STRIPS, NUM_INPUT_STRIPS, TOTAL_STRIPS,
 };
+use crate::ui::file_dialog::{pick_open_file, pick_save_file};
 use crate::ui::native_editor::NativeEditorManager;
 use crate::ui::widgets::{push_button, rotary_knob, vertical_fader, vu_meter};
 use eframe::egui;
 use egui::Color32;
 use ringbuf::traits::{Consumer, Producer};
+use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiScaleMode {
@@ -43,21 +49,45 @@ enum StripViewFilter {
 impl StripViewFilter {
     fn label(self) -> &'static str {
         match self {
-            Self::All => "Toutes (13)",
+            Self::All => "Toutes",
             Self::InputsOnly => "Entrées (1–8)",
             Self::BusesOnly => "Aux & Master",
         }
     }
 }
 
+fn format_time(secs: f32) -> String {
+    let s = secs.max(0.0).floor() as u32;
+    format!("{:02}:{:02}", s / 60, s % 60)
+}
+
+fn format_input_route(route: InputSourceRoute) -> String {
+    match route {
+        InputSourceRoute::None => "Entrée: Aucune".into(),
+        InputSourceRoute::Mono(ch) => format!("In {}", ch + 1),
+        InputSourceRoute::StereoPair(ch) => format!("In {}/{}", ch + 1, ch + 2),
+    }
+}
+
+fn format_output_route(route: OutputTargetRoute) -> String {
+    match route {
+        OutputTargetRoute::None => "Sortie: Aucune".into(),
+        OutputTargetRoute::MasterBus => "Vers Master".into(),
+        OutputTargetRoute::Mono(ch) => format!("Out {}", ch + 1),
+        OutputTargetRoute::StereoPair(ch) => format!("Out {}/{}", ch + 1, ch + 2),
+    }
+}
+
 pub struct UmcMixerApp {
     strips: Vec<StripState>,
+    aux_pair_stereo: [bool; MAX_AUX_PAIRS],
     meters: [MeterFrame; TOTAL_STRIPS],
     // IMPORTANT : déclaré avant `offline_plugins` et `engine` pour fermer toutes les fenêtres natives avant le déchargement des plugins.
     native_editors: NativeEditorManager,
     native_handles: [[Option<NativePluginHandle>; MAX_INSERTS_PER_STRIP]; TOTAL_STRIPS],
     offline_plugins: [[Option<Box<dyn HostedPlugin>>; MAX_INSERTS_PER_STRIP]; TOTAL_STRIPS],
     engine: Option<AudioEngineHandle>,
+    midi_manager: MidiInputManager,
     devices: Vec<String>,
     selected_device: String,
     discovered_plugins: Vec<DiscoveredPlugin>,
@@ -70,6 +100,14 @@ pub struct UmcMixerApp {
     scale_mode: UiScaleMode,
     view_filter: StripViewFilter,
     status_error: Option<String>,
+    status_info: Option<String>,
+    // Lecteur audio MP3 / WAV
+    player_file_path: Option<String>,
+    player_title: String,
+    player_progress: PlayerProgress,
+    player_loop: bool,
+    player_gain: f32,
+    player_target: Option<usize>,
 }
 
 impl Drop for UmcMixerApp {
@@ -80,25 +118,35 @@ impl Drop for UmcMixerApp {
 
 impl UmcMixerApp {
     pub fn new() -> Self {
-        let strips = default_mixer_strips();
+        let mut strips = default_mixer_strips();
         let devices = list_audio_devices();
         let discovered_plugins = scan_system_plugins();
-        let (engine, status_error) = match start_audio_engine(None) {
+        let (mut engine, status_error) = match start_audio_engine(None) {
             Ok(h) => (Some(h), None),
             Err(e) => (None, Some(e)),
         };
+        let mut midi_manager = MidiInputManager::new();
+        if let Some(eng) = engine.as_mut() {
+            midi_manager.attach_sender(eng.midi_tx.take());
+            if eng.out_channels < 10 {
+                let master_idx = NUM_INPUT_STRIPS + NUM_AUX_STRIPS;
+                strips[master_idx].output_route = OutputTargetRoute::StereoPair(0);
+            }
+        }
         let selected_device = engine
             .as_ref()
             .map(|e| e.device_name.clone())
             .unwrap_or_else(|| "Aucun périphérique".into());
 
-        Self {
+        let mut app = Self {
             strips,
+            aux_pair_stereo: [true; MAX_AUX_PAIRS],
             meters: [MeterFrame::default(); TOTAL_STRIPS],
             native_editors: NativeEditorManager::new(),
             native_handles: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             offline_plugins: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             engine,
+            midi_manager,
             devices,
             selected_device,
             discovered_plugins,
@@ -111,13 +159,306 @@ impl UmcMixerApp {
             scale_mode: UiScaleMode::Auto,
             view_filter: StripViewFilter::All,
             status_error,
-        }
+            status_info: None,
+            player_file_path: None,
+            player_title: "Aucun fichier MP3/WAV".into(),
+            player_progress: PlayerProgress::default(),
+            player_loop: false,
+            player_gain: 1.0,
+            player_target: None,
+        };
+        app.sync_all_state_to_engine(false);
+        app
     }
 
     fn send(&mut self, cmd: MixerCommand) {
         if let Some(eng) = self.engine.as_mut() {
             let _ = eng.command_tx.try_push(cmd);
         }
+    }
+
+    fn sync_all_state_to_engine(&mut self, reinstall_plugins: bool) {
+        for pair in 0..MAX_AUX_PAIRS {
+            let stereo = self.aux_pair_stereo[pair];
+            self.send(MixerCommand::SetAuxPairStereo { pair, stereo });
+        }
+        for s_idx in 0..self.strips.len() {
+            let st = self.strips[s_idx].clone();
+            if st.kind == StripKind::Input {
+                self.send(MixerCommand::SetInputRoute {
+                    strip: s_idx,
+                    route: st.input_route,
+                });
+                self.send(MixerCommand::SetGain {
+                    strip: s_idx,
+                    gain_db: st.gain_db,
+                });
+            } else {
+                self.send(MixerCommand::SetOutputRoute {
+                    strip: s_idx,
+                    route: st.output_route,
+                });
+            }
+            self.send(MixerCommand::SetEq {
+                strip: s_idx,
+                eq: st.eq,
+            });
+            self.send(MixerCommand::SetMute {
+                strip: s_idx,
+                mute: st.mute,
+            });
+            if st.kind != StripKind::Master {
+                self.send(MixerCommand::SetSolo {
+                    strip: s_idx,
+                    solo: st.solo,
+                });
+                for (aux_i, &lvl) in st.aux_sends.iter().enumerate() {
+                    self.send(MixerCommand::SetAuxSend {
+                        strip: s_idx,
+                        aux_idx: aux_i,
+                        level: lvl,
+                    });
+                }
+            }
+            self.send(MixerCommand::SetVolume {
+                strip: s_idx,
+                volume_db: st.volume_db,
+            });
+            self.send(MixerCommand::SetStripMidiMode {
+                strip: s_idx,
+                mode: st.midi_mode,
+            });
+
+            if reinstall_plugins {
+                for sl_idx in 0..MAX_INSERTS_PER_STRIP {
+                    let saved_slot = self.strips[s_idx].inserts[sl_idx].clone();
+                    if let Some(plugin) = saved_slot.plugin {
+                        self.install_insert_on_main_thread(s_idx, sl_idx, Some(plugin), false);
+                        self.strips[s_idx].inserts[sl_idx].bypassed = saved_slot.bypassed;
+                        self.send(MixerCommand::BypassInsert {
+                            strip: s_idx,
+                            slot: sl_idx,
+                            bypassed: saved_slot.bypassed,
+                        });
+                        for saved_p in saved_slot.params {
+                            if let Some(cur_p) = self.strips[s_idx].inserts[sl_idx]
+                                .params
+                                .iter_mut()
+                                .find(|p| p.id == saved_p.id)
+                            {
+                                cur_p.value = saved_p.value;
+                                if let Some(NativePluginHandle::Vst3 { controller_ptr, .. }) =
+                                    self.native_handles[s_idx][sl_idx].as_ref()
+                                {
+                                    let norm = f64::from(
+                                        ((saved_p.value - cur_p.min)
+                                            / (cur_p.max - cur_p.min).max(1e-6))
+                                        .clamp(0.0, 1.0),
+                                    );
+                                    self.native_editors.sync_vst3_param_normalized(
+                                        *controller_ptr,
+                                        saved_p.id,
+                                        norm,
+                                    );
+                                }
+                                self.send(MixerCommand::SetPluginParam {
+                                    strip: s_idx,
+                                    slot: sl_idx,
+                                    param_id: saved_p.id,
+                                    value: saved_p.value,
+                                });
+                            }
+                        }
+                    } else {
+                        self.install_insert_on_main_thread(s_idx, sl_idx, None, false);
+                    }
+                }
+            }
+        }
+        self.send(MixerCommand::PlayerSetLoop(self.player_loop));
+        self.send(MixerCommand::PlayerSetGain(self.player_gain));
+        self.send(MixerCommand::PlayerSetTarget(self.player_target));
+    }
+
+    fn toggle_aux_pair_stereo(&mut self, pair: usize, stereo: bool) {
+        if pair >= MAX_AUX_PAIRS || self.aux_pair_stereo[pair] == stereo {
+            return;
+        }
+        self.aux_pair_stereo[pair] = stereo;
+        let idx_l = NUM_INPUT_STRIPS + pair * 2;
+        let idx_r = idx_l + 1;
+        if stereo {
+            self.strips[idx_l].name = format!("AUX {}/{}", pair * 2 + 1, pair * 2 + 2);
+            if let OutputTargetRoute::Mono(ch) = self.strips[idx_l].output_route {
+                self.strips[idx_l].output_route = OutputTargetRoute::StereoPair(ch & !1);
+                self.send(MixerCommand::SetOutputRoute {
+                    strip: idx_l,
+                    route: self.strips[idx_l].output_route,
+                });
+            }
+        } else {
+            self.strips[idx_l].name = format!("AUX {}", pair * 2 + 1);
+            self.strips[idx_r].name = format!("AUX {}", pair * 2 + 2);
+            if let OutputTargetRoute::StereoPair(ch) = self.strips[idx_l].output_route {
+                self.strips[idx_l].output_route = OutputTargetRoute::Mono(ch);
+                self.strips[idx_r].output_route = OutputTargetRoute::Mono(ch + 1);
+                self.send(MixerCommand::SetOutputRoute {
+                    strip: idx_l,
+                    route: self.strips[idx_l].output_route,
+                });
+                self.send(MixerCommand::SetOutputRoute {
+                    strip: idx_r,
+                    route: self.strips[idx_r].output_route,
+                });
+            }
+            for s_idx in 0..NUM_INPUT_STRIPS {
+                if self.strips[s_idx].aux_sends[pair * 2 + 1] == 0.0
+                    && self.strips[s_idx].aux_sends[pair * 2] > 0.0
+                {
+                    let val = self.strips[s_idx].aux_sends[pair * 2];
+                    self.strips[s_idx].aux_sends[pair * 2 + 1] = val;
+                    self.send(MixerCommand::SetAuxSend {
+                        strip: s_idx,
+                        aux_idx: pair * 2 + 1,
+                        level: val,
+                    });
+                }
+            }
+        }
+        self.send(MixerCommand::SetAuxPairStereo { pair, stereo });
+    }
+
+    fn load_audio_file_from_path(&mut self, path: &Path) {
+        match decode_audio_file(path) {
+            Ok(track) => {
+                self.player_title = track.title.clone();
+                self.player_file_path = Some(path.display().to_string());
+                self.player_progress = PlayerProgress {
+                    playing: false,
+                    pos_secs: 0.0,
+                    duration_secs: track.duration_secs(),
+                };
+                self.send(MixerCommand::LoadAudioTrack(Some(Arc::new(track))));
+                self.status_error = None;
+                self.status_info = Some(format!("Audio chargé : {}", self.player_title));
+            }
+            Err(err) => {
+                self.status_error = Some(err);
+            }
+        }
+    }
+
+    fn save_set_to_disk(&mut self) {
+        let Some(mut path) = pick_save_file(
+            "Enregistrer le set du Mixer",
+            "session-umc1820.umcset",
+            &["umcset", "json"],
+        ) else {
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension("umcset");
+        }
+        let set_data = MixerSetFile {
+            version: 2,
+            aux_pair_stereo: self.aux_pair_stereo,
+            strips: self.strips.clone(),
+            selected_device: Some(self.selected_device.clone()),
+            player_file_path: self.player_file_path.clone(),
+            player_loop: self.player_loop,
+            player_gain: self.player_gain,
+            player_target: self.player_target,
+        };
+        match serde_json::to_string_pretty(&set_data) {
+            Ok(json) => match std::fs::write(&path, json) {
+                Ok(()) => {
+                    self.status_error = None;
+                    let fname = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("set");
+                    self.status_info = Some(format!("Set sauvegardé : {fname}"));
+                }
+                Err(e) => self.status_error = Some(format!("Échec écriture fichier set: {e}")),
+            },
+            Err(e) => self.status_error = Some(format!("Échec sérialisation set: {e}")),
+        }
+    }
+
+    fn load_set_from_disk(&mut self) {
+        let Some(path) = pick_open_file("Charger un set du Mixer", &["umcset", "json"]) else {
+            return;
+        };
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status_error = Some(format!("Échec lecture fichier set: {e}"));
+                return;
+            }
+        };
+        let parsed: MixerSetFile = match serde_json::from_str(&raw) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status_error = Some(format!("Fichier set invalide: {e}"));
+                return;
+            }
+        };
+
+        self.native_editors.close_all();
+        self.active_insert_target = None;
+
+        let mut next_strips = default_mixer_strips();
+        if parsed.strips.len() == TOTAL_STRIPS {
+            for (i, mut st) in parsed.strips.into_iter().enumerate() {
+                st.normalize(i);
+                next_strips[i] = st;
+            }
+        } else {
+            for st_in in parsed.strips {
+                let target_idx = match st_in.kind {
+                    StripKind::Input if st_in.index < NUM_INPUT_STRIPS => Some(st_in.index),
+                    StripKind::Aux if st_in.index >= NUM_INPUT_STRIPS => {
+                        let a = st_in.index - NUM_INPUT_STRIPS;
+                        if a < MAX_AUX_PAIRS {
+                            Some(NUM_INPUT_STRIPS + a * 2)
+                        } else if a < NUM_AUX_STRIPS {
+                            Some(NUM_INPUT_STRIPS + a)
+                        } else {
+                            None
+                        }
+                    }
+                    StripKind::Master => Some(NUM_INPUT_STRIPS + NUM_AUX_STRIPS),
+                    _ => None,
+                };
+                if let Some(ti) = target_idx {
+                    let mut st = st_in;
+                    st.normalize(ti);
+                    next_strips[ti] = st;
+                }
+            }
+        }
+
+        self.strips = next_strips;
+        self.aux_pair_stereo = parsed.aux_pair_stereo;
+        self.player_loop = parsed.player_loop;
+        self.player_gain = parsed.player_gain.clamp(0.0, 2.0);
+        self.player_target = parsed.player_target.filter(|&i| i < NUM_INPUT_STRIPS);
+
+        self.sync_all_state_to_engine(true);
+
+        if let Some(track_path) = parsed.player_file_path {
+            let p = Path::new(&track_path);
+            if p.exists() {
+                self.load_audio_file_from_path(p);
+            }
+        }
+
+        self.status_error = None;
+        let fname = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("set");
+        self.status_info = Some(format!("Set chargé : {fname}"));
     }
 
     fn install_insert_on_main_thread(
@@ -215,15 +556,35 @@ impl UmcMixerApp {
         match self.scale_mode {
             UiScaleMode::Auto => {
                 let rect = ctx.screen_rect();
-                let h_scale = ((rect.height() - 56.0) / 560.0).clamp(0.70, 1.10);
-                let w_scale = (rect.width() / 1380.0).clamp(0.78, 1.10);
-                (h_scale * 0.8 + w_scale * 0.2).clamp(0.72, 1.10)
+                let h_scale = ((rect.height() - 88.0) / 590.0).clamp(0.68, 1.08);
+                let w_scale = (rect.width() / 1400.0).clamp(0.76, 1.08);
+                (h_scale * 0.8 + w_scale * 0.2).clamp(0.70, 1.08)
             }
             UiScaleMode::Scale75 => 0.75,
             UiScaleMode::Scale85 => 0.85,
             UiScaleMode::Scale100 => 1.00,
             UiScaleMode::Scale115 => 1.15,
         }
+    }
+
+    fn visible_strip_indices(&self) -> Vec<usize> {
+        let mut res = Vec::new();
+        if self.view_filter != StripViewFilter::BusesOnly {
+            for i in 0..NUM_INPUT_STRIPS {
+                res.push(i);
+            }
+        }
+        if self.view_filter != StripViewFilter::InputsOnly {
+            for p in 0..MAX_AUX_PAIRS {
+                let base = NUM_INPUT_STRIPS + p * 2;
+                res.push(base);
+                if !self.aux_pair_stereo[p] {
+                    res.push(base + 1);
+                }
+            }
+            res.push(NUM_INPUT_STRIPS + NUM_AUX_STRIPS);
+        }
+        res
     }
 }
 
@@ -235,7 +596,13 @@ impl eframe::App for UmcMixerApp {
             while let Some(frame) = eng.meter_rx.try_pop() {
                 self.meters = frame;
             }
+            while let Some(prog) = eng.player_rx.try_pop() {
+                self.player_progress = prog;
+            }
             while let Some(_retired) = eng.retired_plugin_rx.try_pop() {
+                // Libéré proprement sur le thread UI principal
+            }
+            while let Some(_retired_track) = eng.retired_track_rx.try_pop() {
                 // Libéré proprement sur le thread UI principal
             }
         }
@@ -260,40 +627,29 @@ impl eframe::App for UmcMixerApp {
                                 self.engine = None;
                                 self.selected_device = dev.clone();
                                 match start_audio_engine(Some(&dev)) {
-                                    Ok(h) => {
+                                    Ok(mut h) => {
+                                        self.midi_manager.attach_sender(h.midi_tx.take());
+                                        let master_idx = NUM_INPUT_STRIPS + NUM_AUX_STRIPS;
+                                        if h.out_channels < 10
+                                            && self.strips[master_idx].output_route
+                                                == OutputTargetRoute::StereoPair(8)
+                                        {
+                                            self.strips[master_idx].output_route =
+                                                OutputTargetRoute::StereoPair(0);
+                                        }
                                         self.engine = Some(h);
                                         self.status_error = None;
                                     }
                                     Err(e) => self.status_error = Some(e),
                                 }
-                                for s_idx in 0..self.strips.len() {
-                                    for sl_idx in 0..MAX_INSERTS_PER_STRIP {
-                                        if let Some(plugin) =
-                                            self.strips[s_idx].inserts[sl_idx].plugin.clone()
-                                        {
-                                            let byp = self.strips[s_idx].inserts[sl_idx].bypassed;
-                                            self.install_insert_on_main_thread(
-                                                s_idx,
-                                                sl_idx,
-                                                Some(plugin),
-                                                false,
-                                            );
-                                            self.strips[s_idx].inserts[sl_idx].bypassed = byp;
-                                            self.send(MixerCommand::BypassInsert {
-                                                strip: s_idx,
-                                                slot: sl_idx,
-                                                bypassed: byp,
-                                            });
-                                        }
-                                    }
-                                }
+                                self.sync_all_state_to_engine(true);
                             }
                         }
                     });
 
                 egui::ComboBox::from_label("Taille")
                     .selected_text(self.scale_mode.label())
-                    .width(68.0)
+                    .width(64.0)
                     .show_ui(ui, |ui| {
                         for mode in [
                             UiScaleMode::Auto,
@@ -308,7 +664,7 @@ impl eframe::App for UmcMixerApp {
 
                 egui::ComboBox::from_label("Vue")
                     .selected_text(self.view_filter.label())
-                    .width(105.0)
+                    .width(102.0)
                     .show_ui(ui, |ui| {
                         for filter in [
                             StripViewFilter::All,
@@ -319,37 +675,200 @@ impl eframe::App for UmcMixerApp {
                         }
                     });
 
+                let all_stereo = self.aux_pair_stereo.iter().all(|&s| s);
+                let aux_mode_label = if all_stereo {
+                    "Aux: 4 Stéréo → Mono"
+                } else {
+                    "Aux: Mono → 4 Stéréo"
+                };
+                if ui.button(aux_mode_label).clicked() {
+                    let target = !all_stereo;
+                    for p in 0..MAX_AUX_PAIRS {
+                        self.toggle_aux_pair_stereo(p, target);
+                    }
+                }
+
+                ui.separator();
+                if ui.button("Sauver Set").clicked() {
+                    self.save_set_to_disk();
+                }
+                if ui.button("Charger Set").clicked() {
+                    self.load_set_from_disk();
+                }
+
+                ui.separator();
+                ui.label("MIDI");
+                let midi_sel_text = match self.midi_manager.selection() {
+                    MidiPortSelection::All => {
+                        format!("Tous ({})", self.midi_manager.connected_count())
+                    }
+                    MidiPortSelection::None => "Aucun".into(),
+                    MidiPortSelection::Port(name) => name.clone(),
+                };
+                egui::ComboBox::from_id_salt("midi_port_combo")
+                    .selected_text(midi_sel_text)
+                    .width(110.0)
+                    .show_ui(ui, |ui| {
+                        let cur = self.midi_manager.selection().clone();
+                        let mut next: Option<MidiPortSelection> = None;
+                        if ui
+                            .selectable_label(
+                                cur == MidiPortSelection::All,
+                                format!("Tous ({})", self.midi_manager.ports().len()),
+                            )
+                            .clicked()
+                        {
+                            next = Some(MidiPortSelection::All);
+                        }
+                        if ui
+                            .selectable_label(cur == MidiPortSelection::None, "Aucun")
+                            .clicked()
+                        {
+                            next = Some(MidiPortSelection::None);
+                        }
+                        for port in self.midi_manager.ports() {
+                            let target = MidiPortSelection::Port(port.clone());
+                            if ui.selectable_label(cur == target, port).clicked() {
+                                next = Some(target);
+                            }
+                        }
+                        if let Some(sel) = next {
+                            self.midi_manager.select(sel);
+                        }
+                    });
+                if ui.button("Rescan MIDI").clicked() {
+                    self.midi_manager.refresh_ports();
+                }
+                if ui.button("Rescanner Plugins").clicked() {
+                    self.discovered_plugins = scan_system_plugins();
+                }
+
                 if let Some(eng) = &self.engine {
                     ui.label(
-                        egui::RichText::new(format!("{} Hz · {} fr", eng.sample_rate, eng.buffer_frames))
-                            .size(11.0)
-                            .color(Color32::GRAY),
+                        egui::RichText::new(format!(
+                            "{} Hz · {}IN/{}OUT",
+                            eng.sample_rate, eng.in_channels, eng.out_channels
+                        ))
+                        .size(11.0)
+                        .color(Color32::GRAY),
                     );
-                }
-                if ui.button("Rescanner VST2/VST3/AU").clicked() {
-                    self.discovered_plugins = scan_system_plugins();
                 }
                 if let Some(err) = &self.status_error {
                     ui.colored_label(Color32::from_rgb(239, 68, 68), err);
+                } else if let Some(info) = &self.status_info {
+                    ui.colored_label(Color32::from_rgb(16, 185, 129), info);
+                }
+                if let Some(merr) = self.midi_manager.last_error() {
+                    ui.colored_label(Color32::from_rgb(245, 158, 11), merr);
                 }
             });
         });
 
+        // Barre Lecteur Audio MP3 / WAV (Play / Pause / Stop / Progression / Destination)
+        egui::TopBottomPanel::top("player_bar").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Lecteur MP3/WAV").strong().color(Color32::from_rgb(56, 189, 248)));
+                if ui.button("Ouvrir fichier...").clicked() {
+                    if let Some(path) = pick_open_file("Choisir un fichier MP3 ou WAV", &["mp3", "wav"]) {
+                        self.load_audio_file_from_path(&path);
+                    }
+                }
+                ui.label(
+                    egui::RichText::new(&self.player_title)
+                        .monospace()
+                        .size(11.5)
+                        .color(Color32::from_rgb(226, 232, 240)),
+                );
+
+                let has_track = self.player_progress.duration_secs > 0.0;
+                ui.add_enabled_ui(has_track, |ui| {
+                    if self.player_progress.playing {
+                        if ui.button("⏸ Pause").clicked() {
+                            self.send(MixerCommand::PlayerPause);
+                        }
+                    } else if ui.button("▶ Play").clicked() {
+                        self.send(MixerCommand::PlayerPlay);
+                    }
+                    if ui.button("⏹ Stop").clicked() {
+                        self.send(MixerCommand::PlayerStop);
+                    }
+                });
+
+                if ui.checkbox(&mut self.player_loop, "Boucle").changed() {
+                    self.send(MixerCommand::PlayerSetLoop(self.player_loop));
+                }
+
+                let dur = self.player_progress.duration_secs.max(0.01);
+                let mut pos = self.player_progress.pos_secs.clamp(0.0, dur);
+                if has_track {
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut pos, 0.0..=dur)
+                                .show_value(false)
+                                .trailing_fill(true),
+                        )
+                        .changed()
+                    {
+                        self.send(MixerCommand::PlayerSeek(pos));
+                    }
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} / {}",
+                            format_time(pos),
+                            format_time(self.player_progress.duration_secs)
+                        ))
+                        .monospace()
+                        .size(11.0),
+                    );
+                }
+
+                let mut gain_pct = self.player_gain * 100.0;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut gain_pct, 0.0..=150.0)
+                            .prefix("Niv ")
+                            .suffix("%")
+                            .fixed_decimals(0),
+                    )
+                    .changed()
+                {
+                    self.player_gain = gain_pct / 100.0;
+                    self.send(MixerCommand::PlayerSetGain(self.player_gain));
+                }
+
+                let target_label = match self.player_target {
+                    None => "Vers: Master".into(),
+                    Some(i) => format!("Vers: {}", self.strips[i].name),
+                };
+                egui::ComboBox::from_id_salt("player_target_combo")
+                    .selected_text(target_label)
+                    .width(105.0)
+                    .show_ui(ui, |ui| {
+                        let mut next = self.player_target;
+                        let mut changed = false;
+                        changed |= ui.selectable_value(&mut next, None, "Master Direct").changed();
+                        for i in 0..NUM_INPUT_STRIPS {
+                            changed |= ui
+                                .selectable_value(&mut next, Some(i), format!("Tranche {}", i + 1))
+                                .changed();
+                        }
+                        if changed {
+                            self.player_target = next;
+                            self.send(MixerCommand::PlayerSetTarget(next));
+                        }
+                    });
+            });
+        });
+
+        let visible_indices = self.visible_strip_indices();
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.horizontal_top(|ui| {
-                        for i in 0..self.strips.len() {
-                            let visible = match self.view_filter {
-                                StripViewFilter::All => true,
-                                StripViewFilter::InputsOnly => i < NUM_INPUT_STRIPS,
-                                StripViewFilter::BusesOnly => i >= NUM_INPUT_STRIPS,
-                            };
-                            if visible {
-                                self.draw_strip(ui, i, scale);
-                                ui.add_space(4.0 * scale);
-                            }
+                        for idx in visible_indices {
+                            self.draw_strip(ui, idx, scale);
+                            ui.add_space(4.0 * scale);
                         }
                     });
                 });
@@ -369,12 +888,15 @@ impl UmcMixerApp {
             StripKind::Master => Color32::from_rgb(26, 22, 24),
         };
 
-        let strip_w = (112.0 * scale).clamp(84.0, 134.0);
+        let in_ch_count = self.engine.as_ref().map(|e| e.in_channels).unwrap_or(8).max(2);
+        let out_ch_count = self.engine.as_ref().map(|e| e.out_channels).unwrap_or(10).max(2);
+
+        let strip_w = (118.0 * scale).clamp(88.0, 140.0);
         let text_sm = (9.5 * scale).clamp(8.0, 11.0);
         let gain_knob_sz = (30.0 * scale).clamp(22.0, 36.0);
-        let eq_knob_sz = (23.0 * scale).clamp(17.0, 28.0);
-        let aux_knob_sz = (22.0 * scale).clamp(16.0, 27.0);
-        let fader_h = (118.0 * scale).clamp(78.0, 150.0);
+        let eq_knob_sz = (22.0 * scale).clamp(16.0, 27.0);
+        let aux_knob_sz = (21.0 * scale).clamp(15.0, 26.0);
+        let fader_h = (114.0 * scale).clamp(76.0, 146.0);
 
         egui::Frame::none()
             .fill(bg)
@@ -391,7 +913,91 @@ impl UmcMixerApp {
                             .size((12.0 * scale).clamp(9.5, 14.0)),
                     );
 
-                    // 1. Gain rotatif (UNIQUEMENT sur les 8 tranches d'entrée, absent sur Aux et Master)
+                    // Sélecteur d'entrée (Input) ou de sortie (Aux / Master) tout en haut de la tranche
+                    if kind == StripKind::Input {
+                        let cur_route = self.strips[idx].input_route;
+                        egui::ComboBox::from_id_salt(format!("in_route_{idx}"))
+                            .selected_text(egui::RichText::new(format_input_route(cur_route)).size(text_sm))
+                            .width(strip_w - 4.0)
+                            .show_ui(ui, |ui| {
+                                let mut next = cur_route;
+                                let mut changed = false;
+                                changed |= ui
+                                    .selectable_value(&mut next, InputSourceRoute::None, "Aucune / Synth")
+                                    .changed();
+                                for ch in 0..in_ch_count.max(8) {
+                                    changed |= ui
+                                        .selectable_value(
+                                            &mut next,
+                                            InputSourceRoute::Mono(ch),
+                                            format!("In {} (Mono)", ch + 1),
+                                        )
+                                        .changed();
+                                }
+                                let mut ch = 0;
+                                while ch + 1 < in_ch_count.max(8) {
+                                    changed |= ui
+                                        .selectable_value(
+                                            &mut next,
+                                            InputSourceRoute::StereoPair(ch),
+                                            format!("In {}/{} (Stéréo)", ch + 1, ch + 2),
+                                        )
+                                        .changed();
+                                    ch += 2;
+                                }
+                                if changed {
+                                    self.strips[idx].input_route = next;
+                                    self.send(MixerCommand::SetInputRoute { strip: idx, route: next });
+                                }
+                            });
+                    } else {
+                        let cur_route = self.strips[idx].output_route;
+                        egui::ComboBox::from_id_salt(format!("out_route_{idx}"))
+                            .selected_text(egui::RichText::new(format_output_route(cur_route)).size(text_sm))
+                            .width(strip_w - 4.0)
+                            .show_ui(ui, |ui| {
+                                let mut next = cur_route;
+                                let mut changed = false;
+                                changed |= ui
+                                    .selectable_value(&mut next, OutputTargetRoute::None, "Aucune")
+                                    .changed();
+                                if kind == StripKind::Aux {
+                                    changed |= ui
+                                        .selectable_value(
+                                            &mut next,
+                                            OutputTargetRoute::MasterBus,
+                                            "Vers Master",
+                                        )
+                                        .changed();
+                                }
+                                let mut ch = 0;
+                                while ch + 1 < out_ch_count.max(10) {
+                                    changed |= ui
+                                        .selectable_value(
+                                            &mut next,
+                                            OutputTargetRoute::StereoPair(ch),
+                                            format!("Out {}/{} (Stéréo)", ch + 1, ch + 2),
+                                        )
+                                        .changed();
+                                    ch += 2;
+                                }
+                                for ch_m in 0..out_ch_count.max(10) {
+                                    changed |= ui
+                                        .selectable_value(
+                                            &mut next,
+                                            OutputTargetRoute::Mono(ch_m),
+                                            format!("Out {} (Mono)", ch_m + 1),
+                                        )
+                                        .changed();
+                                }
+                                if changed {
+                                    self.strips[idx].output_route = next;
+                                    self.send(MixerCommand::SetOutputRoute { strip: idx, route: next });
+                                }
+                            });
+                    }
+
+                    // 1. Gain rotatif (UNIQUEMENT sur les 8 tranches d'entrée, ou sélecteur Mono/Stéréo sur Aux)
                     if kind == StripKind::Input {
                         let mut gain = self.strips[idx].gain_db;
                         if rotary_knob(
@@ -409,17 +1015,71 @@ impl UmcMixerApp {
                             self.strips[idx].gain_db = gain;
                             self.send(MixerCommand::SetGain { strip: idx, gain_db: gain });
                         }
+                    } else if kind == StripKind::Aux {
+                        let aux_i = idx - NUM_INPUT_STRIPS;
+                        let pair = aux_i / 2;
+                        let is_stereo = self.aux_pair_stereo[pair];
+                        let spacer_h = gain_knob_sz + (gain_knob_sz * 0.48).clamp(11.0, 16.0) + 6.0;
+                        ui.allocate_ui(egui::vec2(strip_w, spacer_h), |ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    egui::RichText::new(if is_stereo {
+                                        "BUS AUX STÉRÉO"
+                                    } else {
+                                        "BUS AUX MONO"
+                                    })
+                                    .size(text_sm)
+                                    .color(if is_stereo {
+                                        Color32::from_rgb(56, 189, 248)
+                                    } else {
+                                        Color32::from_rgb(16, 185, 129)
+                                    }),
+                                );
+                                let btn_lbl = if is_stereo {
+                                    "Séparer Mono"
+                                } else {
+                                    "Lier Stéréo"
+                                };
+                                if ui.small_button(egui::RichText::new(btn_lbl).size(text_sm * 0.92)).clicked() {
+                                    self.toggle_aux_pair_stereo(pair, !is_stereo);
+                                }
+                            });
+                        });
                     } else {
-                        let bus_tag = if is_master { "BUS MASTER" } else { "BUS AUX STÉRÉO" };
                         let spacer_h = gain_knob_sz + (gain_knob_sz * 0.48).clamp(11.0, 16.0) + 6.0;
                         ui.allocate_ui(egui::vec2(strip_w, spacer_h), |ui| {
                             ui.centered_and_justified(|ui| {
-                                ui.label(egui::RichText::new(bus_tag).size(text_sm).color(Color32::GRAY));
+                                ui.label(egui::RichText::new("BUS MASTER").size(text_sm).color(Color32::GRAY));
                             });
                         });
                     }
 
                     ui.separator();
+
+                    // Routage MIDI de la tranche (OFF / OMNI / Canal 1..16)
+                    let midi_label = match self.strips[idx].midi_mode {
+                        None => "MIDI: OFF".to_string(),
+                        Some(0) => "MIDI: OMNI".to_string(),
+                        Some(ch) => format!("MIDI: CH {ch}"),
+                    };
+                    egui::ComboBox::from_id_salt(format!("midi_ch_{idx}"))
+                        .selected_text(egui::RichText::new(midi_label).size(text_sm))
+                        .width(strip_w - 4.0)
+                        .show_ui(ui, |ui| {
+                            let mut mode = self.strips[idx].midi_mode;
+                            let mut changed = false;
+                            changed |= ui.selectable_value(&mut mode, None, "OFF").changed();
+                            changed |= ui.selectable_value(&mut mode, Some(0), "OMNI (1-16)").changed();
+                            for ch in 1..=16_u8 {
+                                changed |= ui
+                                    .selectable_value(&mut mode, Some(ch), format!("Canal {ch}"))
+                                    .changed();
+                            }
+                            if changed {
+                                self.strips[idx].midi_mode = mode;
+                                self.send(MixerCommand::SetStripMidiMode { strip: idx, mode });
+                            }
+                        });
 
                     // 2. 5 emplacements d'inserts VST2/VST3/AU maximum
                     ui.label(egui::RichText::new("INSERTS (5 MAX)").size(text_sm * 0.92).color(Color32::GRAY));
@@ -496,16 +1156,22 @@ impl UmcMixerApp {
 
                     ui.separator();
 
-                    // 3. EQ 4 bandes à boutons rotatifs (grille 2×2 compacte)
-                    ui.label(egui::RichText::new("EQ 4 BANDES").size(text_sm * 0.92).color(Color32::GRAY));
+                    // 3. EQ 5 bandes avec potentiomètre central MID (1 kHz) au milieu
+                    ui.label(egui::RichText::new("EQ 5 BANDES").size(text_sm * 0.92).color(Color32::GRAY));
                     let mut eq = self.strips[idx].eq;
                     let mut eq_changed = false;
-                    egui::Grid::new(format!("eq_grid_{idx}"))
+                    egui::Grid::new(format!("eq_top_{idx}"))
                         .spacing([2.0, 2.0])
                         .show(ui, |ui| {
                             eq_changed |= rotary_knob(ui, &mut eq.high_db, -15.0..=15.0, 0.0, "HI", "dB", Color32::from_rgb(56, 189, 248), eq_knob_sz).changed();
                             eq_changed |= rotary_knob(ui, &mut eq.high_mid_db, -15.0..=15.0, 0.0, "HM", "dB", Color32::from_rgb(56, 189, 248), eq_knob_sz).changed();
                             ui.end_row();
+                        });
+                    // 5ème potentiomètre Médiums centré au milieu
+                    eq_changed |= rotary_knob(ui, &mut eq.mid_db, -15.0..=15.0, 0.0, "MID", "dB", Color32::from_rgb(125, 211, 252), eq_knob_sz).changed();
+                    egui::Grid::new(format!("eq_bot_{idx}"))
+                        .spacing([2.0, 2.0])
+                        .show(ui, |ui| {
                             eq_changed |= rotary_knob(ui, &mut eq.low_mid_db, -15.0..=15.0, 0.0, "LM", "dB", Color32::from_rgb(56, 189, 248), eq_knob_sz).changed();
                             eq_changed |= rotary_knob(ui, &mut eq.low_db, -15.0..=15.0, 0.0, "LO", "dB", Color32::from_rgb(56, 189, 248), eq_knob_sz).changed();
                             ui.end_row();
@@ -517,21 +1183,44 @@ impl UmcMixerApp {
 
                     ui.separator();
 
-                    // 4. 4 boutons rotatifs Auxiliaires en grille 2×2 (absents sur Master)
+                    // 4. Envois Auxiliaires (4 stéréo ou jusqu'à 8 mono si séparés)
                     if !is_master {
                         ui.label(egui::RichText::new("ENVOIS AUX").size(text_sm * 0.92).color(Color32::GRAY));
-                        let aux_labels = ["A1/2", "A3/4", "A5/6", "A7/8"];
+                        let mut active_sends: Vec<(usize, String)> = Vec::new();
+                        for p in 0..MAX_AUX_PAIRS {
+                            if self.aux_pair_stereo[p] {
+                                active_sends.push((p * 2, format!("A{}/{}", p * 2 + 1, p * 2 + 2)));
+                            } else {
+                                active_sends.push((p * 2, format!("A{}", p * 2 + 1)));
+                                active_sends.push((p * 2 + 1, format!("A{}", p * 2 + 2)));
+                            }
+                        }
                         egui::Grid::new(format!("aux_grid_{idx}"))
                             .spacing([2.0, 2.0])
                             .show(ui, |ui| {
-                                for aux_i in 0..NUM_AUX_STRIPS {
-                                    let mut val = self.strips[idx].aux_sends[aux_i] * 100.0;
-                                    if rotary_knob(ui, &mut val, 0.0..=100.0, 0.0, aux_labels[aux_i], "%", Color32::from_rgb(16, 185, 129), aux_knob_sz).changed() {
+                                for (col_i, (aux_i, lbl)) in active_sends.iter().enumerate() {
+                                    let mut val = self.strips[idx].aux_sends[*aux_i] * 100.0;
+                                    if rotary_knob(
+                                        ui,
+                                        &mut val,
+                                        0.0..=100.0,
+                                        0.0,
+                                        lbl,
+                                        "%",
+                                        Color32::from_rgb(16, 185, 129),
+                                        aux_knob_sz,
+                                    )
+                                    .changed()
+                                    {
                                         let norm = val / 100.0;
-                                        self.strips[idx].aux_sends[aux_i] = norm;
-                                        self.send(MixerCommand::SetAuxSend { strip: idx, aux_idx: aux_i, level: norm });
+                                        self.strips[idx].aux_sends[*aux_i] = norm;
+                                        self.send(MixerCommand::SetAuxSend {
+                                            strip: idx,
+                                            aux_idx: *aux_i,
+                                            level: norm,
+                                        });
                                     }
-                                    if aux_i % 2 == 1 {
+                                    if col_i % 2 == 1 {
                                         ui.end_row();
                                     }
                                 }
@@ -542,8 +1231,7 @@ impl UmcMixerApp {
                         let master_aux_spacer_h = (text_sm * 1.3) + 2.0 * aux_knob_h + 8.0;
                         ui.allocate_ui(egui::vec2(strip_w, master_aux_spacer_h), |ui| {
                             ui.centered_and_justified(|ui| {
-                                ui.label(egui::RichText::new("SOMMATION
-MAIN OUT").size(text_sm).color(Color32::from_rgb(110, 120, 140)));
+                                ui.label(egui::RichText::new("SOMMATION\nMAIN OUT").size(text_sm).color(Color32::from_rgb(110, 120, 140)));
                             });
                         });
                         ui.separator();
@@ -692,7 +1380,6 @@ MAIN OUT").size(text_sm).color(Color32::from_rgb(110, 120, 140)));
                 }
 
                 if current_plugin.is_some() && !self.modal_show_catalog {
-                    // Vue Réglages des paramètres du plugin inséré (repli / synchro directe)
                     ui.horizontal(|ui| {
                         ui.strong("Paramètres du plugin");
                         if !self.strips[strip_idx].inserts[slot_idx].params.is_empty()
@@ -778,7 +1465,6 @@ MAIN OUT").size(text_sm).color(Color32::from_rgb(110, 120, 140)));
                             });
                     }
                 } else {
-                    // Vue Catalogue & Recherche de plugins
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Rechercher :");
                         ui.add(

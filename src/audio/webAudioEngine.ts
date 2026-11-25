@@ -1,8 +1,11 @@
 import {
+  AuxPairStereoState,
   DspEffectType,
   InputSourceKind,
   InsertPluginSlot,
   MeterLevel,
+  NUM_AUX_BUSES,
+  PlayerStatus,
   StripState,
 } from '../types/mixer';
 
@@ -31,14 +34,16 @@ interface StripAudioChain {
   insertsOutput: GainNode;
   eqLow: BiquadFilterNode;
   eqLowMid: BiquadFilterNode;
+  eqMid: BiquadFilterNode;
   eqHighMid: BiquadFilterNode;
   eqHigh: BiquadFilterNode;
   muteSoloGain: GainNode;
   faderGain: GainNode;
+  outRouteGain: GainNode;
   analyserL: AnalyserNode;
   analyserR: AnalyserNode;
   splitter: ChannelSplitterNode;
-  auxSends: [GainNode, GainNode, GainNode, GainNode];
+  auxSends: GainNode[];
   activeInserts: InsertNodeBundle[];
   sourceStopper: (() => void) | null;
   currentSource: InputSourceKind;
@@ -229,6 +234,18 @@ export class WebAudioMixerEngine {
   private timeDomainBuffer = new Float32Array(512);
   private running = false;
 
+  // Audio file player (MP3 / WAV)
+  private playerBuffer: AudioBuffer | null = null;
+  private playerTitle: string | null = null;
+  private playerSource: AudioBufferSourceNode | null = null;
+  private playerGainNode: GainNode | null = null;
+  private playerGainValue = 1.0;
+  private playerLoop = false;
+  private playerPlaying = false;
+  private playerOffsetSecs = 0;
+  private playerStartedAtCtxTime = 0;
+  private playerTargetStripId: string | null = null;
+
   public isRunning(): boolean {
     return this.running && this.ctx?.state === 'running';
   }
@@ -237,17 +254,24 @@ export class WebAudioMixerEngine {
     return this.ctx?.sampleRate ?? 48000;
   }
 
-  public async start(strips: StripState[]): Promise<void> {
+  private ensureContext(strips: StripState[]): AudioContext {
     if (!this.ctx) {
-      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       this.ctx = new AudioCtx({ latencyHint: 'interactive' });
       this.buildGraph(strips);
     }
-    if (this.ctx.state === 'suspended') {
-      await this.ctx.resume();
+    return this.ctx;
+  }
+
+  public async start(strips: StripState[]): Promise<void> {
+    const ctx = this.ensureContext(strips);
+    if (ctx.state === 'suspended') {
+      await ctx.resume();
     }
     this.running = true;
-    this.syncAll(strips);
+    this.syncAll(strips, [true, true, true, true]);
   }
 
   public async stop(): Promise<void> {
@@ -255,6 +279,140 @@ export class WebAudioMixerEngine {
     if (this.ctx && this.ctx.state === 'running') {
       await this.ctx.suspend();
     }
+  }
+
+  public async loadAudioFile(file: File, strips: StripState[]): Promise<PlayerStatus> {
+    const ctx = this.ensureContext(strips);
+    if (ctx.state === 'suspended') {
+      await ctx.resume();
+      this.running = true;
+    }
+    const arrayBuffer = await file.arrayBuffer();
+    const decoded = await ctx.decodeAudioData(arrayBuffer);
+    this.stopTrack();
+    this.playerBuffer = decoded;
+    this.playerTitle = file.name;
+    this.playerOffsetSecs = 0;
+    return this.getPlayerStatus();
+  }
+
+  public playTrack(): PlayerStatus {
+    if (!this.ctx || !this.playerBuffer || this.playerPlaying) {
+      return this.getPlayerStatus();
+    }
+    if (this.ctx.state === 'suspended') {
+      void this.ctx.resume();
+      this.running = true;
+    }
+    this.startBufferSourceFrom(this.playerOffsetSecs);
+    return this.getPlayerStatus();
+  }
+
+  public pauseTrack(): PlayerStatus {
+    if (!this.ctx || !this.playerPlaying) {
+      return this.getPlayerStatus();
+    }
+    const elapsed = this.ctx.currentTime - this.playerStartedAtCtxTime;
+    const dur = this.playerBuffer?.duration ?? 0;
+    this.playerOffsetSecs = dur > 0 ? Math.min(dur, this.playerOffsetSecs + elapsed) : 0;
+    this.teardownPlayerSource();
+    this.playerPlaying = false;
+    return this.getPlayerStatus();
+  }
+
+  public stopTrack(): PlayerStatus {
+    this.teardownPlayerSource();
+    this.playerPlaying = false;
+    this.playerOffsetSecs = 0;
+    return this.getPlayerStatus();
+  }
+
+  public seekTrack(secs: number): PlayerStatus {
+    const dur = this.playerBuffer?.duration ?? 0;
+    const clamped = Math.max(0, Math.min(dur, secs));
+    this.playerOffsetSecs = clamped;
+    if (this.playerPlaying) {
+      this.teardownPlayerSource();
+      this.startBufferSourceFrom(clamped);
+    }
+    return this.getPlayerStatus();
+  }
+
+  public setPlayerLoop(loop: boolean) {
+    this.playerLoop = loop;
+    if (this.playerSource) {
+      this.playerSource.loop = loop;
+    }
+  }
+
+  public setPlayerGain(gain: number) {
+    this.playerGainValue = Math.max(0, Math.min(2, gain));
+    if (this.playerGainNode && this.ctx) {
+      this.playerGainNode.gain.setTargetAtTime(this.playerGainValue, this.ctx.currentTime, 0.015);
+    }
+  }
+
+  public setPlayerTarget(stripId: string | null) {
+    this.playerTargetStripId = stripId;
+    if (!this.playerGainNode) return;
+    this.playerGainNode.disconnect();
+    const targetChain = stripId
+      ? this.chains.get(stripId)
+      : this.chains.get('master');
+    if (targetChain) {
+      this.playerGainNode.connect(targetChain.inputSum);
+    }
+  }
+
+  public getPlayerStatus(): PlayerStatus {
+    const dur = this.playerBuffer?.duration ?? 0;
+    let pos = this.playerOffsetSecs;
+    if (this.playerPlaying && this.ctx && dur > 0) {
+      const elapsed = this.ctx.currentTime - this.playerStartedAtCtxTime;
+      const total = this.playerOffsetSecs + elapsed;
+      pos = this.playerLoop ? total % dur : Math.min(dur, total);
+    }
+    return {
+      title: this.playerTitle,
+      playing: this.playerPlaying,
+      posSecs: pos,
+      durationSecs: dur,
+    };
+  }
+
+  private teardownPlayerSource() {
+    if (this.playerSource) {
+      this.playerSource.onended = null;
+      try {
+        this.playerSource.stop();
+      } catch {
+        // ignore
+      }
+      this.playerSource.disconnect();
+      this.playerSource = null;
+    }
+  }
+
+  private startBufferSourceFrom(offsetSecs: number) {
+    if (!this.ctx || !this.playerBuffer || !this.playerGainNode) return;
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.playerBuffer;
+    src.loop = this.playerLoop;
+    src.connect(this.playerGainNode);
+    const dur = this.playerBuffer.duration;
+    const safeOffset = dur > 0 ? offsetSecs % dur : 0;
+    this.playerStartedAtCtxTime = this.ctx.currentTime;
+    this.playerOffsetSecs = safeOffset;
+    this.playerPlaying = true;
+    src.onended = () => {
+      if (this.playerSource === src && !this.playerLoop) {
+        this.playerPlaying = false;
+        this.playerOffsetSecs = 0;
+        this.playerSource = null;
+      }
+    };
+    src.start(0, safeOffset);
+    this.playerSource = src;
   }
 
   private createStripChain(ctx: AudioContext): StripAudioChain {
@@ -273,6 +431,11 @@ export class WebAudioMixerEngine {
     eqLowMid.frequency.value = 400;
     eqLowMid.Q.value = 1.0;
 
+    const eqMid = ctx.createBiquadFilter();
+    eqMid.type = 'peaking';
+    eqMid.frequency.value = 1000;
+    eqMid.Q.value = 1.0;
+
     const eqHighMid = ctx.createBiquadFilter();
     eqHighMid.type = 'peaking';
     eqHighMid.frequency.value = 2500;
@@ -284,6 +447,7 @@ export class WebAudioMixerEngine {
 
     const muteSoloGain = ctx.createGain();
     const faderGain = ctx.createGain();
+    const outRouteGain = ctx.createGain();
 
     const splitter = ctx.createChannelSplitter(2);
     const analyserL = ctx.createAnalyser();
@@ -291,21 +455,18 @@ export class WebAudioMixerEngine {
     const analyserR = ctx.createAnalyser();
     analyserR.fftSize = 512;
 
-    const auxSends: [GainNode, GainNode, GainNode, GainNode] = [
-      ctx.createGain(),
-      ctx.createGain(),
-      ctx.createGain(),
-      ctx.createGain(),
-    ];
+    const auxSends: GainNode[] = Array.from({ length: NUM_AUX_BUSES }, () => ctx.createGain());
 
     inputSum.connect(trimGain);
     trimGain.connect(insertsInput);
     insertsOutput.connect(eqLow);
     eqLow.connect(eqLowMid);
-    eqLowMid.connect(eqHighMid);
+    eqLowMid.connect(eqMid);
+    eqMid.connect(eqHighMid);
     eqHighMid.connect(eqHigh);
     eqHigh.connect(muteSoloGain);
     muteSoloGain.connect(faderGain);
+    faderGain.connect(outRouteGain);
 
     // Post-fader metering & Aux sends
     faderGain.connect(splitter);
@@ -323,10 +484,12 @@ export class WebAudioMixerEngine {
       insertsOutput,
       eqLow,
       eqLowMid,
+      eqMid,
       eqHighMid,
       eqHigh,
       muteSoloGain,
       faderGain,
+      outRouteGain,
       analyserL,
       analyserR,
       splitter,
@@ -352,41 +515,53 @@ export class WebAudioMixerEngine {
 
     const masterChain = masterStrip ? this.chains.get(masterStrip.id) : undefined;
     if (masterChain) {
-      masterChain.faderGain.connect(ctx.destination);
+      masterChain.outRouteGain.connect(ctx.destination);
     }
 
-    // Connect 4 Aux strips -> Master
+    // Player Gain -> Master or selected Input strip
+    this.playerGainNode = ctx.createGain();
+    this.playerGainNode.gain.value = this.playerGainValue;
+    this.setPlayerTarget(this.playerTargetStripId);
+
+    // Connect 8 Aux strips -> Master
     auxStrips.forEach((auxStrip) => {
       const auxChain = this.chains.get(auxStrip.id);
       if (auxChain && masterChain) {
-        auxChain.faderGain.connect(masterChain.inputSum);
+        auxChain.outRouteGain.connect(masterChain.inputSum);
       }
     });
 
-    // Connect 8 Input strips -> Master & 4 Aux buses
+    // Connect 8 Input strips -> Master & 8 Aux buses
     inputStrips.forEach((inStrip) => {
       const inChain = this.chains.get(inStrip.id);
       if (!inChain) return;
       if (masterChain) {
-        inChain.faderGain.connect(masterChain.inputSum);
+        inChain.outRouteGain.connect(masterChain.inputSum);
       }
       auxStrips.forEach((auxStrip, auxIdx) => {
         const auxChain = this.chains.get(auxStrip.id);
-        if (auxChain && auxIdx < 4) {
+        if (auxChain && auxIdx < NUM_AUX_BUSES) {
           inChain.auxSends[auxIdx].connect(auxChain.inputSum);
         }
       });
     });
   }
 
-  public syncAll(strips: StripState[]) {
+  public syncAll(strips: StripState[], auxPairStereo: AuxPairStereoState) {
     if (!this.ctx) return;
     const ctx = this.ctx;
 
     const anyInputSolo = strips.some((s) => s.kind === 'input' && s.solo);
-    const anyAuxSolo = strips.some((s) => s.kind === 'aux' && s.solo);
+    const anyAuxSolo = strips.some((s, idx) => {
+      if (s.kind !== 'aux') return false;
+      const auxIndex = idx - 8;
+      const pair = Math.floor(auxIndex / 2);
+      const isActive = auxPairStereo[pair] ? auxIndex % 2 === 0 : true;
+      return isActive && s.solo;
+    });
     const anySolo = anyInputSolo || anyAuxSolo;
 
+    let auxCursor = 0;
     for (const strip of strips) {
       const chain = this.chains.get(strip.id);
       if (!chain) continue;
@@ -395,10 +570,11 @@ export class WebAudioMixerEngine {
       const trimLinear = strip.kind === 'input' ? dbToGain(strip.gainDb) : 1;
       chain.trimGain.gain.setTargetAtTime(trimLinear, ctx.currentTime, 0.015);
 
-      // 4-Band EQ
+      // 5-Band EQ (with center Mid band)
       const eqBypass = strip.eq.bypassed;
       chain.eqLow.gain.setTargetAtTime(eqBypass ? 0 : strip.eq.lowGainDb, ctx.currentTime, 0.02);
       chain.eqLowMid.gain.setTargetAtTime(eqBypass ? 0 : strip.eq.lowMidGainDb, ctx.currentTime, 0.02);
+      chain.eqMid.gain.setTargetAtTime(eqBypass ? 0 : (strip.eq.midGainDb ?? 0), ctx.currentTime, 0.02);
       chain.eqHighMid.gain.setTargetAtTime(eqBypass ? 0 : strip.eq.highMidGainDb, ctx.currentTime, 0.02);
       chain.eqHigh.gain.setTargetAtTime(eqBypass ? 0 : strip.eq.highGainDb, ctx.currentTime, 0.02);
 
@@ -412,9 +588,34 @@ export class WebAudioMixerEngine {
       // Volume Fader
       chain.faderGain.gain.setTargetAtTime(dbToGain(strip.volumeDb), ctx.currentTime, 0.015);
 
-      // 4 Aux Sends (0..100% -> 0.0..1.0)
-      for (let i = 0; i < 4; i++) {
-        chain.auxSends[i].gain.setTargetAtTime(strip.auxSends[i] / 100, ctx.currentTime, 0.015);
+      // Output route gating & Mono/Stereo Aux channel mode
+      if (strip.kind === 'aux') {
+        const pair = Math.floor(auxCursor / 2);
+        const isStereoPair = auxPairStereo[pair] ?? true;
+        const isSecondaryInStereo = isStereoPair && auxCursor % 2 === 1;
+        chain.inputSum.channelCount = isStereoPair ? 2 : 1;
+        chain.inputSum.channelCountMode = isStereoPair ? 'max' : 'explicit';
+        const routeActive = !isSecondaryInStereo && strip.outputRoute.kind !== 'none';
+        chain.outRouteGain.gain.setTargetAtTime(routeActive ? 1 : 0, ctx.currentTime, 0.015);
+        auxCursor++;
+      } else if (strip.kind === 'master') {
+        const routeActive = strip.outputRoute.kind !== 'none';
+        chain.outRouteGain.gain.setTargetAtTime(routeActive ? 1 : 0, ctx.currentTime, 0.015);
+      } else {
+        chain.outRouteGain.gain.setTargetAtTime(1, ctx.currentTime, 0.015);
+      }
+
+      // 8 Aux Sends (respecting stereo link vs split mono)
+      for (let p = 0; p < 4; p++) {
+        const sendL = (strip.auxSends[p * 2] ?? 0) / 100;
+        const sendR = (strip.auxSends[p * 2 + 1] ?? 0) / 100;
+        if (auxPairStereo[p]) {
+          chain.auxSends[p * 2].gain.setTargetAtTime(sendL, ctx.currentTime, 0.015);
+          chain.auxSends[p * 2 + 1].gain.setTargetAtTime(0, ctx.currentTime, 0.015);
+        } else {
+          chain.auxSends[p * 2].gain.setTargetAtTime(sendL, ctx.currentTime, 0.015);
+          chain.auxSends[p * 2 + 1].gain.setTargetAtTime(sendR, ctx.currentTime, 0.015);
+        }
       }
 
       // Sync Inserts if plugin list changed
@@ -443,7 +644,6 @@ export class WebAudioMixerEngine {
       return;
     }
 
-    // Rebuild insert chain cleanly
     chain.insertsInput.disconnect();
     for (const bundle of chain.activeInserts) {
       bundle.dispose();
@@ -517,7 +717,6 @@ export class WebAudioMixerEngine {
         if (ctx.state !== 'running') return;
         const now = ctx.currentTime;
         if (step % 4 === 0) {
-          // Punchy kick
           const osc = ctx.createOscillator();
           const g = ctx.createGain();
           osc.type = 'sine';
@@ -530,7 +729,6 @@ export class WebAudioMixerEngine {
           osc.start(now);
           osc.stop(now + 0.3);
         } else if (step % 4 === 2) {
-          // Crisp hat/snare pulse
           const osc = ctx.createOscillator();
           const g = ctx.createGain();
           osc.type = 'triangle';
