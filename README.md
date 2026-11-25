@@ -45,3 +45,4 @@ Console de mixage logicielle multi-plateforme (macOS & Linux) compatible **Behri
    ```bash
    cargo run --release
    ```
+   <img width="1905" height="908" alt="2026-11-25_14-01" src="https://github.com/user-attachments/assets/dda757f0-bb63-4e79-baad-fde372be80c9" />
