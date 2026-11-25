@@ -6715,6 +6715,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiScaleMode {
     Auto,
+    Scale50,
     Scale75,
     Scale85,
     Scale100,
@@ -6725,6 +6726,7 @@ impl UiScaleMode {
     fn label(self) -> &'static str {
         match self {
             Self::Auto => "Auto",
+            Self::Scale50 => "50%",
             Self::Scale75 => "75%",
             Self::Scale85 => "85%",
             Self::Scale100 => "100%",
@@ -7254,6 +7256,7 @@ impl UmcMixerApp {
                 let w_scale = (rect.width() / 1400.0).clamp(0.76, 1.08);
                 (h_scale * 0.8 + w_scale * 0.2).clamp(0.70, 1.08)
             }
+            UiScaleMode::Scale50 => 0.50,
             UiScaleMode::Scale75 => 0.75,
             UiScaleMode::Scale85 => 0.85,
             UiScaleMode::Scale100 => 1.00,
@@ -7347,6 +7350,7 @@ impl eframe::App for UmcMixerApp {
                     .show_ui(ui, |ui| {
                         for mode in [
                             UiScaleMode::Auto,
+                            UiScaleMode::Scale50,
                             UiScaleMode::Scale75,
                             UiScaleMode::Scale85,
                             UiScaleMode::Scale100,

@@ -887,6 +887,7 @@ export default function App() {
                 <option value={1}>Taille 100%</option>
                 <option value={0.88}>Compact 88%</option>
                 <option value={0.76}>Petit écran 76%</option>
+                <option value={0.5}>Très compact 50%</option>
               </select>
             </>
           )}
