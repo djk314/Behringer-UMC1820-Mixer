@@ -14,6 +14,7 @@ import {
 import { WebAudioMixerEngine } from './audio/webAudioEngine';
 import { ChannelStrip } from './components/ChannelStrip';
 import { PluginModal } from './components/PluginModal';
+import { RemoteControlView, RemoteWsStatus } from './components/RemoteControlView';
 import { RoutingMatrixView } from './components/RoutingMatrixView';
 import { RustCodeExplorer } from './components/RustCodeExplorer';
 import { RUST_PROJECT_FILES } from './data/rustProjectFiles';
@@ -37,7 +38,7 @@ import {
 } from './types/mixer';
 import { buildZipArchive } from './utils/zipBuilder';
 
-type ActiveTab = 'console' | 'routing' | 'rust';
+type ActiveTab = 'console' | 'routing' | 'remote' | 'rust';
 type OsDriverProfile = 'macos_coreaudio' | 'linux_alsa';
 type StripViewFilter = 'all' | 'inputs' | 'buses';
 type HardwareProfileId = 'umc1820' | 'stereo_2x2' | 'quad_4x4' | 'studio_16x16';
@@ -363,10 +364,168 @@ export default function App() {
   const [playerGain, setPlayerGain] = useState(1.0);
   const [playerTargetStripId, setPlayerTargetStripId] = useState<string | null>(null);
 
+  // Remote WebSocket client state (to connect directly to Mac Rust app)
+  const [wsAddress, setWsAddress] = useState('ws://192.168.1.42:8080/ws');
+  const [wsStatus, setWsStatus] = useState<RemoteWsStatus>('disconnected');
+  const [wsError, setWsError] = useState<string | null>(null);
+  const [remoteDeviceName, setRemoteDeviceName] = useState<string | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+
   const engineRef = useRef<WebAudioMixerEngine | null>(null);
   if (!engineRef.current) {
     engineRef.current = new WebAudioMixerEngine();
   }
+
+  const sendRemoteCmd = useCallback((payload: Record<string, unknown>) => {
+    const sock = wsRef.current;
+    if (sock && sock.readyState === WebSocket.OPEN) {
+      sock.send(JSON.stringify(payload));
+    }
+  }, []);
+
+  const disconnectRemoteWs = useCallback(() => {
+    if (wsRef.current) {
+      wsRef.current.onclose = null;
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    setWsStatus('disconnected');
+    setRemoteDeviceName(null);
+  }, []);
+
+  const connectRemoteWs = useCallback(() => {
+    disconnectRemoteWs();
+    setWsError(null);
+    setWsStatus('connecting');
+    try {
+      const sock = new WebSocket(wsAddress.trim());
+      wsRef.current = sock;
+      sock.onopen = () => {
+        setWsStatus('connected');
+        setWsError(null);
+        sock.send(JSON.stringify({ type: 'request_state' }));
+      };
+      sock.onerror = () => {
+        setWsStatus('error');
+        setWsError(
+          window.location.protocol === 'https:'
+            ? 'Connexion ws:// bloquée depuis HTTPS. Ouvrez directement http://<IP-du-Mac>:8080 sur Safari iPad.'
+            : 'Impossible de joindre le serveur WebSocket du Mac.'
+        );
+      };
+      sock.onclose = () => {
+        if (wsRef.current === sock) {
+          wsRef.current = null;
+          setWsStatus((prev) => (prev === 'error' ? 'error' : 'disconnected'));
+        }
+      };
+      sock.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(String(ev.data));
+          if (msg.type === 'state' && Array.isArray(msg.strips)) {
+            setRemoteDeviceName(typeof msg.device === 'string' ? msg.device : 'Mac');
+            if (Array.isArray(msg.aux_pair_stereo) && msg.aux_pair_stereo.length === 4) {
+              setAuxPairStereo(msg.aux_pair_stereo as AuxPairStereoState);
+            }
+            setStrips((prev) =>
+              prev.map((localStrip, idx) => {
+                const remote = msg.strips[idx];
+                if (!remote) return localStrip;
+                let inputRoute: HardwareInputRoute = localStrip.inputRoute;
+                if (remote.input_route === 'None') inputRoute = { kind: 'none' };
+                else if (remote.input_route?.Mono !== undefined)
+                  inputRoute = { kind: 'mono', channel: remote.input_route.Mono };
+                else if (remote.input_route?.StereoPair !== undefined)
+                  inputRoute = { kind: 'stereo', channel: remote.input_route.StereoPair };
+
+                let outputRoute: HardwareOutputRoute = localStrip.outputRoute;
+                if (remote.output_route === 'None') outputRoute = { kind: 'none' };
+                else if (remote.output_route === 'MasterBus') outputRoute = { kind: 'master' };
+                else if (remote.output_route?.Mono !== undefined)
+                  outputRoute = { kind: 'mono', channel: remote.output_route.Mono };
+                else if (remote.output_route?.StereoPair !== undefined)
+                  outputRoute = { kind: 'stereo', channel: remote.output_route.StereoPair };
+
+                const auxSends: AuxSendsTuple = [...EMPTY_AUX_SENDS] as AuxSendsTuple;
+                if (Array.isArray(remote.aux_sends)) {
+                  for (let a = 0; a < NUM_AUX_BUSES; a++) {
+                    auxSends[a] = Math.round((Number(remote.aux_sends[a]) || 0) * 100);
+                  }
+                }
+                return {
+                  ...localStrip,
+                  name: typeof remote.name === 'string' ? remote.name : localStrip.name,
+                  inputRoute,
+                  outputRoute,
+                  hardwareChannelLabel:
+                    localStrip.kind === 'input'
+                      ? formatInputRouteLabel(inputRoute)
+                      : formatOutputRouteLabel(outputRoute),
+                  gainDb: typeof remote.gain_db === 'number' ? remote.gain_db : localStrip.gainDb,
+                  solo: Boolean(remote.solo),
+                  mute: Boolean(remote.mute),
+                  volumeDb:
+                    typeof remote.volume_db === 'number' ? remote.volume_db : localStrip.volumeDb,
+                  eq: {
+                    lowGainDb: remote.eq?.low_db ?? localStrip.eq.lowGainDb,
+                    lowMidGainDb: remote.eq?.low_mid_db ?? localStrip.eq.lowMidGainDb,
+                    midGainDb: remote.eq?.mid_db ?? localStrip.eq.midGainDb,
+                    highMidGainDb: remote.eq?.high_mid_db ?? localStrip.eq.highMidGainDb,
+                    highGainDb: remote.eq?.high_db ?? localStrip.eq.highGainDb,
+                    bypassed: Boolean(remote.eq?.bypassed),
+                  },
+                  auxSends,
+                };
+              })
+            );
+            if (msg.player) {
+              setPlayerLoop(Boolean(msg.player.loop_enabled));
+              if (typeof msg.player.gain === 'number') setPlayerGain(msg.player.gain);
+              setPlayerTargetStripId(
+                typeof msg.player.target === 'number' ? `in-${msg.player.target + 1}` : null
+              );
+              setPlayerStatus({
+                title: msg.player.title ?? null,
+                playing: Boolean(msg.player.playing),
+                posSecs: Number(msg.player.pos_secs) || 0,
+                durationSecs: Number(msg.player.duration_secs) || 0,
+              });
+            }
+          } else if (msg.type === 'meters' && Array.isArray(msg.meters)) {
+            setMeters((prev) => {
+              const next: Record<string, MeterLevel> = { ...prev };
+              msg.meters.forEach((m: { pl: number; pr: number; rl: number; rr: number; clip: boolean }, i: number) => {
+                const id = i < 8 ? `in-${i + 1}` : i < 16 ? `aux-${i - 7}` : 'master';
+                next[id] = {
+                  peakDbL: m.pl,
+                  peakDbR: m.pr,
+                  rmsDbL: m.rl,
+                  rmsDbR: m.rr,
+                  clip: Boolean(m.clip),
+                };
+              });
+              return next;
+            });
+            if (msg.player) {
+              setPlayerStatus((prev) => ({
+                ...prev,
+                playing: Boolean(msg.player.playing),
+                posSecs: Number(msg.player.pos_secs) || 0,
+                durationSecs: Number(msg.player.duration_secs) || 0,
+              }));
+            }
+          }
+        } catch {
+          // ignore malformed remote frame
+        }
+      };
+    } catch {
+      setWsStatus('error');
+      setWsError('URL WebSocket invalide.');
+    }
+  }, [disconnectRemoteWs, wsAddress]);
+
+  useEffect(() => () => disconnectRemoteWs(), [disconnectRemoteWs]);
 
   // Sync mixer state into Web Audio DSP graph whenever parameters change
   useEffect(() => {
@@ -378,7 +537,7 @@ export default function App() {
   // 60fps real-time VU metering & player transport progress loop
   useEffect(() => {
     if (!engineRunning && !playerStatus.playing) {
-      if (!engineRunning) setMeters({});
+      if (!engineRunning && wsStatus !== 'connected') setMeters({});
       return;
     }
     let rafId = 0;
@@ -394,7 +553,7 @@ export default function App() {
     };
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [engineRunning, playerStatus.playing]);
+  }, [engineRunning, playerStatus.playing, wsStatus]);
 
   const showTemporaryNotice = useCallback((msg: string) => {
     setSetNotice(msg);
@@ -421,12 +580,81 @@ export default function App() {
   };
 
   const handleUpdateStrip = (stripId: string, updater: (prev: StripState) => StripState) => {
-    setStrips((prev) => prev.map((s) => (s.id === stripId ? updater(s) : s)));
+    setStrips((prev) =>
+      prev.map((s) => {
+        if (s.id !== stripId) return s;
+        const next = updater(s);
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          const idx = next.index;
+          if (next.volumeDb !== s.volumeDb) {
+            sendRemoteCmd({ type: 'set_volume', strip: idx, volume_db: next.volumeDb });
+          }
+          if (next.gainDb !== s.gainDb) {
+            sendRemoteCmd({ type: 'set_gain', strip: idx, gain_db: next.gainDb });
+          }
+          if (next.mute !== s.mute) {
+            sendRemoteCmd({ type: 'set_mute', strip: idx, mute: next.mute });
+          }
+          if (next.solo !== s.solo) {
+            sendRemoteCmd({ type: 'set_solo', strip: idx, solo: next.solo });
+          }
+          if (next.eq.bypassed !== s.eq.bypassed) {
+            sendRemoteCmd({ type: 'set_eq_bypass', strip: idx, bypassed: next.eq.bypassed });
+          }
+          if (next.eq.lowGainDb !== s.eq.lowGainDb) {
+            sendRemoteCmd({ type: 'set_eq_band', strip: idx, band: 'low', value_db: next.eq.lowGainDb });
+          }
+          if (next.eq.lowMidGainDb !== s.eq.lowMidGainDb) {
+            sendRemoteCmd({ type: 'set_eq_band', strip: idx, band: 'low_mid', value_db: next.eq.lowMidGainDb });
+          }
+          if (next.eq.midGainDb !== s.eq.midGainDb) {
+            sendRemoteCmd({ type: 'set_eq_band', strip: idx, band: 'mid', value_db: next.eq.midGainDb });
+          }
+          if (next.eq.highMidGainDb !== s.eq.highMidGainDb) {
+            sendRemoteCmd({ type: 'set_eq_band', strip: idx, band: 'high_mid', value_db: next.eq.highMidGainDb });
+          }
+          if (next.eq.highGainDb !== s.eq.highGainDb) {
+            sendRemoteCmd({ type: 'set_eq_band', strip: idx, band: 'high', value_db: next.eq.highGainDb });
+          }
+          for (let a = 0; a < NUM_AUX_BUSES; a++) {
+            if (next.auxSends[a] !== s.auxSends[a]) {
+              sendRemoteCmd({
+                type: 'set_aux_send',
+                strip: idx,
+                aux_idx: a,
+                level: (next.auxSends[a] ?? 0) / 100,
+              });
+            }
+          }
+          if (JSON.stringify(next.inputRoute) !== JSON.stringify(s.inputRoute)) {
+            sendRemoteCmd({
+              type: 'set_input_route',
+              strip: idx,
+              kind: next.inputRoute.kind,
+              channel: next.inputRoute.kind === 'none' ? 0 : next.inputRoute.channel,
+            });
+          }
+          if (JSON.stringify(next.outputRoute) !== JSON.stringify(s.outputRoute)) {
+            sendRemoteCmd({
+              type: 'set_output_route',
+              strip: idx,
+              kind: next.outputRoute.kind,
+              channel:
+                next.outputRoute.kind === 'mono' || next.outputRoute.kind === 'stereo'
+                  ? next.outputRoute.channel
+                  : 0,
+            });
+          }
+        }
+        return next;
+      })
+    );
   };
 
   const handleToggleAuxPair = (pairIndex: number) => {
     if (pairIndex < 0 || pairIndex >= MAX_AUX_PAIRS) return;
     const nextIsStereo = !auxPairStereo[pairIndex];
+    sendRemoteCmd({ type: 'set_aux_pair_stereo', pair: pairIndex, stereo: nextIsStereo });
     setAuxPairStereo((prev) => {
       const next = [...prev] as AuxPairStereoState;
       next[pairIndex] = nextIsStereo;
@@ -480,6 +708,9 @@ export default function App() {
   const handleToggleAllAuxMode = () => {
     const anyMono = auxPairStereo.some((v) => !v);
     const targetStereo = anyMono;
+    for (let p = 0; p < MAX_AUX_PAIRS; p++) {
+      sendRemoteCmd({ type: 'set_aux_pair_stereo', pair: p, stereo: targetStereo });
+    }
     setAuxPairStereo([targetStereo, targetStereo, targetStereo, targetStereo]);
     setStrips((prev) =>
       prev.map((s) => {
@@ -754,6 +985,20 @@ export default function App() {
           </button>
           <button
             type="button"
+            onClick={() => setActiveTab('remote')}
+            className={`flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer transition-colors pb-0.5 border-b-2 ${
+              activeTab === 'remote'
+                ? 'text-white border-amber-400'
+                : 'text-slate-400 border-transparent hover:text-slate-200'
+            }`}
+          >
+            <span>Télécommande iPad</span>
+            {wsStatus === 'connected' && (
+              <span className="w-2 h-2 rounded-full bg-emerald-400" aria-hidden="true" />
+            )}
+          </button>
+          <button
+            type="button"
             onClick={() => setActiveTab('rust')}
             className={`whitespace-nowrap shrink-0 cursor-pointer transition-colors pb-0.5 border-b-2 ${
               activeTab === 'rust'
@@ -894,9 +1139,10 @@ export default function App() {
           {anySoloActive && (
             <button
               type="button"
-              onClick={() =>
-                setStrips((prev) => prev.map((s) => ({ ...s, solo: false })))
-              }
+              onClick={() => {
+                sendRemoteCmd({ type: 'clear_all_solo' });
+                setStrips((prev) => prev.map((s) => ({ ...s, solo: false })));
+              }}
               className="px-3 py-1.5 text-xs font-medium bg-amber-500/15 text-amber-300 border border-amber-500/40 rounded hover:bg-amber-500/25 cursor-pointer whitespace-nowrap"
             >
               Désactiver Solo
@@ -943,6 +1189,7 @@ export default function App() {
               disabled={!playerStatus.title}
               aria-label="Lecture"
               onClick={() => {
+                sendRemoteCmd({ type: 'player_play' });
                 if (!engineRef.current) return;
                 const status = engineRef.current.playTrack();
                 setPlayerStatus(status);
@@ -961,6 +1208,7 @@ export default function App() {
               disabled={!playerStatus.playing}
               aria-label="Pause"
               onClick={() => {
+                sendRemoteCmd({ type: 'player_pause' });
                 if (!engineRef.current) return;
                 setPlayerStatus(engineRef.current.pauseTrack());
               }}
@@ -974,6 +1222,7 @@ export default function App() {
               disabled={!playerStatus.title}
               aria-label="Stop"
               onClick={() => {
+                sendRemoteCmd({ type: 'player_stop' });
                 if (!engineRef.current) return;
                 setPlayerStatus(engineRef.current.stopTrack());
               }}
@@ -988,6 +1237,7 @@ export default function App() {
               onClick={() => {
                 const next = !playerLoop;
                 setPlayerLoop(next);
+                sendRemoteCmd({ type: 'player_set_loop', loop_enabled: next });
                 engineRef.current?.setPlayerLoop(next);
               }}
               className={`flex items-center gap-1 px-2 py-1 rounded border text-[11px] cursor-pointer ${
@@ -1018,8 +1268,10 @@ export default function App() {
               disabled={!playerStatus.title}
               value={Math.min(playerStatus.posSecs, playerStatus.durationSecs || 1)}
               onChange={(e) => {
+                const pos = Number(e.target.value);
+                sendRemoteCmd({ type: 'player_seek', pos_secs: pos });
                 if (!engineRef.current) return;
-                const status = engineRef.current.seekTrack(Number(e.target.value));
+                const status = engineRef.current.seekTrack(pos);
                 setPlayerStatus(status);
               }}
               className="w-full accent-amber-400 cursor-pointer disabled:opacity-40"
@@ -1041,6 +1293,7 @@ export default function App() {
               onChange={(e) => {
                 const val = Number(e.target.value);
                 setPlayerGain(val);
+                sendRemoteCmd({ type: 'player_set_gain', gain: val });
                 engineRef.current?.setPlayerGain(val);
               }}
               className="w-20 accent-sky-400 cursor-pointer"
@@ -1056,6 +1309,8 @@ export default function App() {
             onChange={(e) => {
               const target = e.target.value === 'master' ? null : e.target.value;
               setPlayerTargetStripId(target);
+              const targetIdx = target ? Number(target.replace('in-', '')) - 1 : null;
+              sendRemoteCmd({ type: 'player_set_target', target: targetIdx });
               engineRef.current?.setPlayerTarget(target);
             }}
             className="bg-[#0B0E14] border border-[#232936] rounded px-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-sky-500"
@@ -1168,6 +1423,18 @@ export default function App() {
             auxPairStereo={auxPairStereo}
             onUpdateStrip={handleUpdateStrip}
             onToggleAuxPair={handleToggleAuxPair}
+          />
+        )}
+
+        {activeTab === 'remote' && (
+          <RemoteControlView
+            wsAddress={wsAddress}
+            onChangeWsAddress={setWsAddress}
+            wsStatus={wsStatus}
+            wsError={wsError}
+            remoteDeviceName={remoteDeviceName}
+            onConnect={connectRemoteWs}
+            onDisconnect={disconnectRemoteWs}
           />
         )}
 

@@ -1,4 +1,5 @@
 mod audio;
+mod remote;
 mod ui;
 
 use eframe::egui;

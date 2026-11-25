@@ -15,6 +15,10 @@ Console de mixage logicielle multi-plateforme (macOS & Linux) compatible **Behri
 - **VST2 (macOS & Linux)** : hébergement C-ABI (`AEffect`, `effProcessEvents` MIDI, `effEditOpen` / `effEditIdle`) avec fenêtre graphique native.
 - **Entrées MIDI temps réel (CoreMIDI / ALSA)** : sélection globale du port MIDI dans la barre supérieure et filtre par tranche (`OFF`, `OMNI`, `Canal 1–16`).
 
+## Télécommande iPad / Navigateur Web (WebSocket + OSC)
+- **Serveur intégré sur le Mac (`port 8080`)** : dès le lancement, l'application affiche l'adresse locale dans la barre supérieure (ex. `http://192.168.1.42:8080`). Ouvrez cette URL dans **Safari sur iPad** (sur le même Wi-Fi) pour piloter en temps réel toutes les tranches (faders tactiles, VU-mètres, Mute/Solo, Gain, EQ 5 bandes, Aux Stéréo/Mono, sélecteurs I/O, inserts et lecteur MP3/WAV).
+- **Serveur OSC UDP léger (`port 9000`)** : compatible TouchOSC / Lemur avec les adresses `/strip/{1..17}/volume` (0..1), `/volume_db`, `/gain`, `/mute`, `/solo`, `/aux/{1..8}`, `/eq/{low|low_mid|mid|high_mid|high}` et `/player/{play|pause|stop}`.
+
 ## Compilation sur macOS (CoreAudio + AU/VST3/VST2)
 1. Installer ou mettre à jour Rust (**rustc >= 1.88 requis**) :
    ```bash

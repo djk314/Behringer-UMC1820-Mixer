@@ -1215,13 +1215,16 @@ mod platform {
                         let cfg = ev.configure;
                         if let Some(ed) = self.open.iter().find(|e| e.window == cfg.window) {
                             if let X11Backend::Vst3 { view, .. } = &ed.backend {
-                                let mut vr = ViewRect {
-                                    left: 0,
-                                    top: 0,
-                                    right: cfg.width.max(100),
-                                    bottom: cfg.height.max(100),
-                                };
-                                let _ = ((*(*view).vtbl).on_size)(*view as *mut c_void, &mut vr);
+                                let pv = *view;
+                                if !pv.is_null() {
+                                    let mut vr = ViewRect {
+                                        left: 0,
+                                        top: 0,
+                                        right: cfg.width.max(100),
+                                        bottom: cfg.height.max(100),
+                                    };
+                                    let _ = ((*(*pv).vtbl).on_size)(pv as *mut c_void, &mut vr);
+                                }
                             }
                         }
                     }

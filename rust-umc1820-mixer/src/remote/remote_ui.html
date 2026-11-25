@@ -1,0 +1,713 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>UMC1820 Remote — iPad</title>
+  <style>
+    :root {
+      --bg: #0b0e14;
+      --bar: #10151f;
+      --strip-in: #131720;
+      --strip-aux: #111924;
+      --strip-master: #1a161b;
+      --border: #232936;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --amber: #f59e0b;
+      --sky: #38bdf8;
+      --emerald: #10b981;
+      --red: #ef4444;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body {
+      margin: 0; padding: 0; height: 100%; overflow: hidden;
+      background: var(--bg); color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+      user-select: none; -webkit-user-select: none;
+    }
+    .app { display: flex; flex-direction: column; height: 100dvh; }
+    .topbar {
+      display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+      gap: 8px; padding: 8px 12px; background: var(--bar); border-bottom: 1px solid var(--border);
+    }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 14px; }
+    .badge {
+      font-size: 11px; font-family: ui-monospace, monospace; padding: 3px 8px;
+      border-radius: 4px; border: 1px solid var(--border); background: #0b0e14;
+    }
+    .badge.ok { color: #34d399; border-color: rgba(16,185,129,0.45); background: rgba(16,185,129,0.12); }
+    .badge.wait { color: #fbbf24; border-color: rgba(245,158,11,0.45); background: rgba(245,158,11,0.12); }
+    .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    button, select {
+      background: #1a202c; color: var(--text); border: 1px solid #2d3545;
+      border-radius: 6px; padding: 6px 10px; font-size: 12px; font-weight: 600;
+      cursor: pointer;
+    }
+    button.active-sky { background: rgba(56,189,248,0.18); border-color: rgba(56,189,248,0.5); color: #7dd3fc; }
+    button.active-emerald { background: rgba(16,185,129,0.18); border-color: rgba(16,185,129,0.5); color: #6ee7b7; }
+    button.active-amber { background: rgba(245,158,11,0.22); border-color: rgba(245,158,11,0.55); color: #fcd34d; }
+    button.active-red { background: var(--red); border-color: #f87171; color: #fff; }
+    .playerbar {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+      padding: 6px 12px; background: #0d1119; border-bottom: 1px solid var(--border);
+      font-size: 12px;
+    }
+    .player-title {
+      font-family: ui-monospace, monospace; font-size: 11px; color: #cbd5e1;
+      max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .player-seek { flex: 1; min-width: 120px; accent-color: var(--amber); }
+    .mixer-scroll {
+      flex: 1; overflow-x: auto; overflow-y: auto; -webkit-overflow-scrolling: touch;
+      padding: 10px; display: flex; align-items: stretch; gap: 8px;
+    }
+    .strip {
+      width: 152px; min-width: 152px; flex-shrink: 0;
+      border: 1px solid var(--border); border-radius: 8px; padding: 8px;
+      display: flex; flex-direction: column; gap: 7px;
+    }
+    .strip.input { background: var(--strip-in); }
+    .strip.aux { background: var(--strip-aux); border-color: rgba(56,189,248,0.25); }
+    .strip.master { background: var(--strip-master); border-color: rgba(245,158,11,0.35); }
+    .strip-head { display: flex; flex-direction: column; gap: 4px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+    .strip-name { font-size: 13px; font-weight: 700; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .strip-sub { font-size: 10px; font-family: ui-monospace, monospace; color: var(--muted); text-align: center; }
+    .io-select { width: 100%; font-size: 11px; padding: 5px 6px; background: #0b0e14; }
+    .sec { border-bottom: 1px solid var(--border); padding-bottom: 6px; display: flex; flex-direction: column; gap: 4px; }
+    .sec-head { display: flex; justify-content: space-between; align-items: center; font-size: 10px; color: var(--muted); font-weight: 600; }
+    .slider-row { display: flex; flex-direction: column; gap: 2px; }
+    .slider-lbl { display: flex; justify-content: space-between; font-size: 10px; font-family: ui-monospace, monospace; color: #cbd5e1; }
+    input[type="range"] { width: 100%; margin: 0; height: 22px; touch-action: pan-x; }
+    .eq-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 6px; }
+    .eq-mid { display: flex; justify-content: center; }
+    .eq-mid > .slider-row { width: 72%; }
+    .btn-row { display: flex; gap: 6px; }
+    .btn-row button { flex: 1; padding: 9px 4px; font-size: 12px; border-radius: 6px; }
+    .btn-solo.on { background: var(--amber); color: #0b0e14; border-color: #fcd34d; }
+    .btn-mute.on { background: var(--red); color: #fff; border-color: #f87171; }
+    .fader-area {
+      display: flex; align-items: center; justify-content: center; gap: 10px;
+      padding-top: 2px; flex: 1; min-height: 175px;
+    }
+    .fader-track {
+      position: relative; width: 46px; height: 170px;
+      background: #0b0e14; border: 1px solid #2d3545; border-radius: 6px;
+      touch-action: none; cursor: ns-resize;
+    }
+    .fader-line {
+      position: absolute; left: 50%; top: 10px; bottom: 10px; width: 2px;
+      background: #232936; transform: translateX(-50%);
+    }
+    .fader-zero {
+      position: absolute; left: 6px; right: 6px; height: 1px; background: rgba(245,158,11,0.5);
+    }
+    .fader-thumb {
+      position: absolute; left: 4px; right: 4px; height: 24px;
+      background: linear-gradient(180deg, #475569, #334155);
+      border: 1px solid #94a3b8; border-radius: 4px;
+      display: flex; align-items: center; justify-content: center;
+      pointer-events: none;
+    }
+    .fader-thumb::after {
+      content: ""; width: 20px; height: 2px; background: #e2e8f0; border-radius: 1px;
+    }
+    .meter-wrap { display: flex; gap: 3px; height: 170px; padding: 3px; background: #090c11; border: 1px solid #232936; border-radius: 4px; }
+    .meter-bar { position: relative; width: 8px; height: 100%; background: #141923; border-radius: 2px; overflow: hidden; }
+    .meter-fill {
+      position: absolute; left: 0; right: 0; bottom: 0; height: 0%;
+      background: linear-gradient(to top, #10b981 0%, #22c55e 65%, #f59e0b 85%, #ef4444 100%);
+      transition: height 40ms linear;
+    }
+    .meter-clip { position: absolute; top: 0; left: 0; right: 0; height: 4px; background: #ef4444; display: none; }
+    .db-readout {
+      text-align: center; font-family: ui-monospace, monospace; font-size: 11px;
+      background: #0b0e14; border: 1px solid var(--border); border-radius: 4px; padding: 3px;
+    }
+    .insert-pill {
+      display: flex; align-items: center; justify-content: space-between; gap: 4px;
+      font-size: 10px; padding: 4px 6px; background: #0b0e14; border: 1px solid #232936;
+      border-radius: 4px; cursor: pointer;
+    }
+    .insert-pill.active { border-color: rgba(56,189,248,0.45); background: #161f2e; }
+    .modal-backdrop {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.68); display: none;
+      align-items: center; justify-content: center; padding: 16px; z-index: 50;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      width: 100%; max-width: 440px; max-height: 82dvh; background: #131720;
+      border: 1px solid #334155; border-radius: 10px; display: flex; flex-direction: column; overflow: hidden;
+    }
+    .modal-head {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 12px 14px; border-bottom: 1px solid var(--border); font-weight: 700; font-size: 14px;
+    }
+    .modal-body { padding: 12px 14px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+  </style>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <span>UMC1820 Remote</span>
+      <span id="wsBadge" class="badge wait">Connexion...</span>
+      <span id="hwInfo" class="badge" style="color:#94a3b8;">--</span>
+    </div>
+    <div class="controls">
+      <button id="viewAll" class="active-amber" onclick="setView('all')">Toutes</button>
+      <button id="viewIn" onclick="setView('inputs')">Entrées 1–8</button>
+      <button id="viewBus" onclick="setView('buses')">Aux &amp; Master</button>
+      <button id="auxModeBtn" class="active-sky" onclick="toggleAllAux()">Aux: 4 Stéréo</button>
+      <button id="clearSoloBtn" style="display:none;" class="active-amber" onclick="sendCmd({type:'clear_all_solo'})">Off Solo</button>
+      <button onclick="togglePlayerBar()">Lecteur</button>
+    </div>
+  </header>
+
+  <div id="playerBar" class="playerbar">
+    <strong style="color:#38bdf8;">MP3/WAV</strong>
+    <span id="plTitle" class="player-title">Aucun fichier</span>
+    <button onclick="sendCmd({type:'player_play'})">▶</button>
+    <button onclick="sendCmd({type:'player_pause'})">⏸</button>
+    <button onclick="sendCmd({type:'player_stop'})">⏹</button>
+    <button id="plLoopBtn" onclick="togglePlayerLoop()">Boucle</button>
+    <span id="plTime" style="font-family:monospace;font-size:11px;">00:00 / 00:00</span>
+    <input id="plSeek" class="player-seek" type="range" min="0" max="1" step="0.1" value="0" />
+    <label style="font-size:11px;display:flex;align-items:center;gap:4px;">
+      Vol <input id="plGain" type="range" min="0" max="1.5" step="0.01" value="1" style="width:76px;" />
+    </label>
+    <select id="plTarget" style="font-size:11px;padding:4px 6px;"></select>
+  </div>
+
+  <main id="mixerScroll" class="mixer-scroll"></main>
+</div>
+
+<div id="pluginModalBg" class="modal-backdrop" onclick="if(event.target===this) closePluginModal()">
+  <div class="modal">
+    <div class="modal-head">
+      <span id="pmTitle">Plugin</span>
+      <button onclick="closePluginModal()">Fermer</button>
+    </div>
+    <div id="pmBody" class="modal-body"></div>
+  </div>
+</div>
+
+<script>
+  let ws = null;
+  let state = null;
+  let currentView = 'all';
+  let showPlayer = true;
+  let activeDragKey = null;
+  let modalTarget = null;
+  let reconnectTimer = null;
+
+  function setView(v) {
+    currentView = v;
+    document.getElementById('viewAll').className = v === 'all' ? 'active-amber' : '';
+    document.getElementById('viewIn').className = v === 'inputs' ? 'active-amber' : '';
+    document.getElementById('viewBus').className = v === 'buses' ? 'active-amber' : '';
+    renderMixer();
+  }
+
+  function togglePlayerBar() {
+    showPlayer = !showPlayer;
+    document.getElementById('playerBar').style.display = showPlayer ? 'flex' : 'none';
+  }
+
+  function sendCmd(obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
+    }
+  }
+
+  function toggleAllAux() {
+    if (!state) return;
+    const allStereo = state.aux_pair_stereo.every(Boolean);
+    const target = !allStereo;
+    for (let p = 0; p < 4; p++) {
+      state.aux_pair_stereo[p] = target;
+      sendCmd({ type: 'set_aux_pair_stereo', pair: p, stereo: target });
+    }
+    renderMixer();
+  }
+
+  function togglePlayerLoop() {
+    if (!state) return;
+    const next = !state.player.loop_enabled;
+    state.player.loop_enabled = next;
+    sendCmd({ type: 'player_set_loop', loop_enabled: next });
+    updatePlayerUI();
+  }
+
+  function fmtTime(secs) {
+    const s = Math.max(0, Math.floor(secs || 0));
+    return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+  }
+
+  function esc(str) {
+    return String(str ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function dbToPct(db) {
+    if (db <= -59.5) return 0;
+    return Math.max(0, Math.min(100, ((db + 60) / 72) * 100));
+  }
+
+  function pctToDb(pct) {
+    const p = Math.max(0, Math.min(1, pct));
+    return Math.round((-60 + p * 72) * 10) / 10;
+  }
+
+  function meterDbToHeight(db) {
+    const clamped = Math.max(-60, Math.min(0, db));
+    return ((clamped + 60) / 60) * 100;
+  }
+
+  function connectWS() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${proto}//${location.host}/ws`;
+    const badge = document.getElementById('wsBadge');
+    badge.textContent = 'Connexion...';
+    badge.className = 'badge wait';
+
+    ws = new WebSocket(url);
+    ws.onopen = () => {
+      badge.textContent = 'Connecté';
+      badge.className = 'badge ok';
+      sendCmd({ type: 'request_state' });
+    };
+    ws.onclose = () => {
+      badge.textContent = 'Déconnecté · Reconnexion';
+      badge.className = 'badge wait';
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connectWS, 1500);
+    };
+    ws.onerror = () => {
+      try { ws.close(); } catch (_) {}
+    };
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (_) { return; }
+      if (msg.type === 'state') {
+        state = msg;
+        renderStateSync();
+      } else if (msg.type === 'meters') {
+        updateMetersUI(msg.meters, msg.player);
+      }
+    };
+  }
+
+  function renderStateSync() {
+    if (!state) return;
+    document.getElementById('hwInfo').textContent = `${state.device} · ${state.in_channels}IN/${state.out_channels}OUT`;
+    const anySolo = state.strips.some(s => s.kind !== 'Master' && s.solo);
+    document.getElementById('clearSoloBtn').style.display = anySolo ? 'inline-block' : 'none';
+    const allStereo = state.aux_pair_stereo.every(Boolean);
+    const auxBtn = document.getElementById('auxModeBtn');
+    auxBtn.textContent = allStereo ? 'Aux: 4 Stéréo → Mono' : 'Aux: Mono → 4 Stéréo';
+    auxBtn.className = allStereo ? 'active-sky' : 'active-emerald';
+    updatePlayerUI();
+
+    if (!activeDragKey) {
+      renderMixer();
+    } else {
+      // Update non-dragged toggles cleanly
+      state.strips.forEach((st, idx) => {
+        const sBtn = document.getElementById(`solo-${idx}`);
+        if (sBtn) sBtn.className = `btn-solo ${st.solo ? 'on' : ''}`;
+        const mBtn = document.getElementById(`mute-${idx}`);
+        if (mBtn) mBtn.className = `btn-mute ${st.mute ? 'on' : ''}`;
+      });
+    }
+    if (modalTarget !== null) {
+      renderPluginModal();
+    }
+  }
+
+  function updatePlayerUI() {
+    if (!state || !state.player) return;
+    const p = state.player;
+    document.getElementById('plTitle').textContent = p.title || 'Aucun fichier';
+    const loopBtn = document.getElementById('plLoopBtn');
+    loopBtn.className = p.loop_enabled ? 'active-sky' : '';
+    const seek = document.getElementById('plSeek');
+    const dur = Math.max(0.01, p.duration_secs || 0);
+    seek.max = dur;
+    if (activeDragKey !== 'pl-seek') {
+      seek.value = Math.min(p.pos_secs || 0, dur);
+    }
+    if (activeDragKey !== 'pl-gain') {
+      document.getElementById('plGain').value = p.gain ?? 1;
+    }
+    document.getElementById('plTime').textContent = `${fmtTime(p.pos_secs)} / ${fmtTime(p.duration_secs)}`;
+    const sel = document.getElementById('plTarget');
+    if (sel.options.length === 0) {
+      sel.innerHTML = `<option value="">Master Direct</option>` +
+        Array.from({length: 8}, (_, i) => `<option value="${i}">Tranche ${i + 1}</option>`).join('');
+    }
+    sel.value = p.target === null || p.target === undefined ? '' : String(p.target);
+  }
+
+  function updateMetersUI(meters, playerProg) {
+    if (Array.isArray(meters)) {
+      meters.forEach((m, idx) => {
+        const fl = document.getElementById(`ml-${idx}`);
+        const fr = document.getElementById(`mr-${idx}`);
+        const cl = document.getElementById(`mc-${idx}`);
+        if (fl) fl.style.height = meterDbToHeight(m.pl) + '%';
+        if (fr) fr.style.height = meterDbToHeight(m.pr) + '%';
+        if (cl) cl.style.display = m.clip ? 'block' : 'none';
+      });
+    }
+    if (playerProg && state && state.player) {
+      state.player.playing = playerProg.playing;
+      state.player.pos_secs = playerProg.pos_secs;
+      state.player.duration_secs = playerProg.duration_secs;
+      const seek = document.getElementById('plSeek');
+      const dur = Math.max(0.01, playerProg.duration_secs || 0);
+      seek.max = dur;
+      if (activeDragKey !== 'pl-seek') seek.value = Math.min(playerProg.pos_secs || 0, dur);
+      document.getElementById('plTime').textContent = `${fmtTime(playerProg.pos_secs)} / ${fmtTime(playerProg.duration_secs)}`;
+    }
+  }
+
+  function getVisibleIndices() {
+    if (!state) return [];
+    const res = [];
+    if (currentView !== 'buses') {
+      for (let i = 0; i < 8; i++) res.push(i);
+    }
+    if (currentView !== 'inputs') {
+      for (let p = 0; p < 4; p++) {
+        res.push(8 + p * 2);
+        if (!state.aux_pair_stereo[p]) res.push(8 + p * 2 + 1);
+      }
+      res.push(16);
+    }
+    return res;
+  }
+
+  function encodeInputRoute(r) {
+    if (!r || r === 'None') return 'none:0';
+    if (r.Mono !== undefined) return `mono:${r.Mono}`;
+    if (r.StereoPair !== undefined) return `stereo:${r.StereoPair}`;
+    return 'none:0';
+  }
+
+  function encodeOutputRoute(r) {
+    if (!r || r === 'None') return 'none:0';
+    if (r === 'MasterBus') return 'master:0';
+    if (r.Mono !== undefined) return `mono:${r.Mono}`;
+    if (r.StereoPair !== undefined) return `stereo:${r.StereoPair}`;
+    return 'none:0';
+  }
+
+  function renderMixer() {
+    if (!state) return;
+    const container = document.getElementById('mixerScroll');
+    const indices = getVisibleIndices();
+    const inCh = Math.max(8, state.in_channels || 8);
+    const outCh = Math.max(10, state.out_channels || 10);
+
+    container.innerHTML = indices.map((idx) => {
+      const st = state.strips[idx];
+      const kindCls = st.kind === 'Master' ? 'master' : st.kind === 'Aux' ? 'aux' : 'input';
+      const isMaster = st.kind === 'Master';
+      const isAux = st.kind === 'Aux';
+      const isInput = st.kind === 'Input';
+      const pairIdx = isAux ? Math.floor((idx - 8) / 2) : -1;
+      const isAuxStereo = isAux && state.aux_pair_stereo[pairIdx];
+
+      let ioHtml = '';
+      if (isInput) {
+        const cur = encodeInputRoute(st.input_route);
+        let opts = `<option value="none:0">Aucune / Synth</option>`;
+        for (let c = 0; c < inCh; c++) opts += `<option value="mono:${c}">In ${c + 1} (Mono)</option>`;
+        for (let c = 0; c + 1 < inCh; c += 2) opts += `<option value="stereo:${c}">In ${c + 1}/${c + 2} (Stéréo)</option>`;
+        ioHtml = `<select class="io-select" onchange="onInputRoute(${idx}, this.value)">${opts}</select>`;
+      } else {
+        let opts = `<option value="none:0">Sortie: Aucune</option>`;
+        if (isAux) opts += `<option value="master:0">Vers Master</option>`;
+        for (let c = 0; c + 1 < outCh; c += 2) opts += `<option value="stereo:${c}">Out ${c + 1}/${c + 2} (Stéréo)</option>`;
+        for (let c = 0; c < outCh; c++) opts += `<option value="mono:${c}">Out ${c + 1} (Mono)</option>`;
+        ioHtml = `<select class="io-select" onchange="onOutputRoute(${idx}, this.value)">${opts}</select>`;
+      }
+
+      const topCtrlHtml = isInput
+        ? `<div class="sec">
+             <div class="slider-row">
+               <div class="slider-lbl"><span>GAIN</span><span id="gain-lbl-${idx}">${st.gain_db >= 0 ? '+' : ''}${st.gain_db.toFixed(1)} dB</span></div>
+               <input type="range" min="-12" max="24" step="0.5" value="${st.gain_db}"
+                 onpointerdown="activeDragKey='gain-${idx}'" onpointerup="activeDragKey=null"
+                 ondblclick="onGain(${idx},0);this.value=0"
+                 oninput="onGain(${idx}, Number(this.value))" />
+             </div>
+           </div>`
+        : isAux
+          ? `<div class="sec">
+               <button class="${isAuxStereo ? 'active-sky' : 'active-emerald'}" style="padding:5px;font-size:11px;"
+                 onclick="sendCmd({type:'set_aux_pair_stereo',pair:${pairIdx},stereo:${!isAuxStereo}})">
+                 ${isAuxStereo ? 'Stéréo → Séparer Mono' : 'Mono → Lier Stéréo'}
+               </button>
+             </div>`
+          : `<div class="sec"><div class="strip-sub" style="padding:4px 0;">BUS PRINCIPAL</div></div>`;
+
+      const activeInserts = st.inserts
+        .map((ins, sl) => ({ ins, sl }))
+        .filter(x => x.ins.plugin !== null);
+      const insertsHtml = activeInserts.length > 0
+        ? activeInserts.map(({ ins, sl }) => `
+            <div class="insert-pill ${ins.bypassed ? '' : 'active'}" onclick="openPluginModal(${idx}, ${sl})">
+              <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(ins.plugin.name)}</span>
+              <span style="color:${ins.bypassed ? '#64748b' : '#34d399'};font-family:monospace;">${ins.bypassed ? 'BYP' : 'ON'}</span>
+            </div>`).join('')
+        : `<div class="strip-sub" style="padding:2px 0;">Aucun insert actif</div>`;
+
+      const eqBandsTop = [
+        { k: 'high', lbl: 'HI 10k', val: st.eq.high_db },
+        { k: 'high_mid', lbl: 'HM 2.5k', val: st.eq.high_mid_db },
+      ];
+      const eqBandsBot = [
+        { k: 'low_mid', lbl: 'LM 400', val: st.eq.low_mid_db },
+        { k: 'low', lbl: 'LO 80', val: st.eq.low_db },
+      ];
+      const mkEqSlider = (b) => `
+        <div class="slider-row">
+          <div class="slider-lbl"><span>${b.lbl}</span><span id="eq-${idx}-${b.k}">${b.val > 0 ? '+' : ''}${b.val.toFixed(1)}</span></div>
+          <input type="range" min="-15" max="15" step="0.5" value="${b.val}"
+            onpointerdown="activeDragKey='eq-${idx}-${b.k}'" onpointerup="activeDragKey=null"
+            ondblclick="onEq(${idx},'${b.k}',0);this.value=0"
+            oninput="onEq(${idx},'${b.k}', Number(this.value))" />
+        </div>`;
+
+      let auxHtml = '';
+      if (!isMaster) {
+        const activeAux = [];
+        for (let p = 0; p < 4; p++) {
+          if (state.aux_pair_stereo[p]) activeAux.push({ a: p * 2, lbl: `A${p * 2 + 1}/${p * 2 + 2}` });
+          else {
+            activeAux.push({ a: p * 2, lbl: `A${p * 2 + 1}` });
+            activeAux.push({ a: p * 2 + 1, lbl: `A${p * 2 + 2}` });
+          }
+        }
+        auxHtml = `
+          <div class="sec">
+            <div class="sec-head"><span>ENVOIS AUX</span></div>
+            <div class="eq-grid">
+              ${activeAux.map(x => {
+                const pct = Math.round((st.aux_sends[x.a] || 0) * 100);
+                return `<div class="slider-row">
+                  <div class="slider-lbl"><span>${x.lbl}</span><span id="aux-${idx}-${x.a}">${pct}%</span></div>
+                  <input type="range" min="0" max="100" step="1" value="${pct}" style="accent-color:#10b981;"
+                    onpointerdown="activeDragKey='aux-${idx}-${x.a}'" onpointerup="activeDragKey=null"
+                    ondblclick="onAux(${idx},${x.a},0);this.value=0"
+                    oninput="onAux(${idx},${x.a}, Number(this.value))" />
+                </div>`;
+              }).join('')}
+            </div>
+          </div>`;
+      }
+
+      const fPct = dbToPct(st.volume_db);
+      const zeroPct = dbToPct(0);
+      const thumbTop = (100 - fPct) * 1.46; // 170 - 24 = 146px travel
+
+      return `
+        <section class="strip ${kindCls}">
+          <div class="strip-head">
+            <div class="strip-name">${esc(st.name)}</div>
+            ${ioHtml}
+          </div>
+          ${topCtrlHtml}
+          <div class="sec">
+            <div class="sec-head"><span>INSERTS</span><span>${activeInserts.length}/5</span></div>
+            ${insertsHtml}
+          </div>
+          <div class="sec">
+            <div class="sec-head">
+              <span>EQ 5 BANDES</span>
+              <button style="padding:2px 6px;font-size:10px;" class="${st.eq.bypassed ? '' : 'active-sky'}"
+                onclick="sendCmd({type:'set_eq_bypass',strip:${idx},bypassed:${!st.eq.bypassed}})">
+                ${st.eq.bypassed ? 'OFF' : 'ON'}
+              </button>
+            </div>
+            <div class="eq-grid">${eqBandsTop.map(mkEqSlider).join('')}</div>
+            <div class="eq-mid">${mkEqSlider({ k: 'mid', lbl: 'MID 1k', val: st.eq.mid_db })}</div>
+            <div class="eq-grid">${eqBandsBot.map(mkEqSlider).join('')}</div>
+          </div>
+          ${auxHtml}
+          <div class="btn-row">
+            ${!isMaster ? `<button id="solo-${idx}" class="btn-solo ${st.solo ? 'on' : ''}" onclick="toggleSolo(${idx})">SOLO</button>` : ''}
+            <button id="mute-${idx}" class="btn-mute ${st.mute ? 'on' : ''}" onclick="toggleMute(${idx})">MUTE</button>
+          </div>
+          <div class="fader-area">
+            <div id="fader-${idx}" class="fader-track" data-idx="${idx}">
+              <div class="fader-line"></div>
+              <div class="fader-zero" style="bottom:${zeroPct}%;"></div>
+              <div id="thumb-${idx}" class="fader-thumb" style="top:${thumbTop}px;"></div>
+            </div>
+            <div class="meter-wrap">
+              <div class="meter-bar"><div id="ml-${idx}" class="meter-fill"></div><div id="mc-${idx}" class="meter-clip"></div></div>
+              <div class="meter-bar"><div id="mr-${idx}" class="meter-fill"></div></div>
+            </div>
+          </div>
+          <div id="vol-lbl-${idx}" class="db-readout">${st.volume_db <= -59.5 ? '-∞ dB' : (st.volume_db > 0 ? '+' : '') + st.volume_db.toFixed(1) + ' dB'}</div>
+        </section>`;
+    }).join('');
+
+    // Restore selected I/O values & attach touch fader listeners
+    indices.forEach((idx) => {
+      const st = state.strips[idx];
+      const sec = container.querySelector(`#fader-${idx}`)?.closest('.strip');
+      if (sec) {
+        const sel = sec.querySelector('.io-select');
+        if (sel) {
+          sel.value = st.kind === 'Input' ? encodeInputRoute(st.input_route) : encodeOutputRoute(st.output_route);
+        }
+      }
+      attachFaderTouch(idx);
+    });
+  }
+
+  function attachFaderTouch(idx) {
+    const track = document.getElementById(`fader-${idx}`);
+    if (!track) return;
+    let lastTap = 0;
+
+    const updateFromClientY = (clientY) => {
+      const rect = track.getBoundingClientRect();
+      const pad = 12;
+      const rel = 1 - (clientY - rect.top - pad) / Math.max(1, rect.height - pad * 2);
+      const db = pctToDb(rel);
+      applyVolumeLocal(idx, db);
+    };
+
+    track.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      const now = Date.now();
+      if (now - lastTap < 280) {
+        applyVolumeLocal(idx, 0);
+        lastTap = 0;
+        return;
+      }
+      lastTap = now;
+      activeDragKey = `fader-${idx}`;
+      track.setPointerCapture(e.pointerId);
+      updateFromClientY(e.clientY);
+    });
+    track.addEventListener('pointermove', (e) => {
+      if (activeDragKey !== `fader-${idx}`) return;
+      updateFromClientY(e.clientY);
+    });
+    const endDrag = () => {
+      if (activeDragKey === `fader-${idx}`) activeDragKey = null;
+    };
+    track.addEventListener('pointerup', endDrag);
+    track.addEventListener('pointercancel', endDrag);
+  }
+
+  function applyVolumeLocal(idx, db) {
+    if (!state || !state.strips[idx]) return;
+    state.strips[idx].volume_db = db;
+    const pct = dbToPct(db);
+    const thumb = document.getElementById(`thumb-${idx}`);
+    if (thumb) thumb.style.top = ((100 - pct) * 1.46) + 'px';
+    const lbl = document.getElementById(`vol-lbl-${idx}`);
+    if (lbl) lbl.textContent = db <= -59.5 ? '-∞ dB' : (db > 0 ? '+' : '') + db.toFixed(1) + ' dB';
+    sendCmd({ type: 'set_volume', strip: idx, volume_db: db });
+  }
+
+  function onInputRoute(idx, val) {
+    const [kind, ch] = val.split(':');
+    sendCmd({ type: 'set_input_route', strip: idx, kind, channel: Number(ch) || 0 });
+  }
+  function onOutputRoute(idx, val) {
+    const [kind, ch] = val.split(':');
+    sendCmd({ type: 'set_output_route', strip: idx, kind, channel: Number(ch) || 0 });
+  }
+  function onGain(idx, db) {
+    if (state?.strips[idx]) state.strips[idx].gain_db = db;
+    const lbl = document.getElementById(`gain-lbl-${idx}`);
+    if (lbl) lbl.textContent = `${db >= 0 ? '+' : ''}${db.toFixed(1)} dB`;
+    sendCmd({ type: 'set_gain', strip: idx, gain_db: db });
+  }
+  function onEq(idx, band, db) {
+    const lbl = document.getElementById(`eq-${idx}-${band}`);
+    if (lbl) lbl.textContent = `${db > 0 ? '+' : ''}${db.toFixed(1)}`;
+    sendCmd({ type: 'set_eq_band', strip: idx, band, value_db: db });
+  }
+  function onAux(idx, auxIdx, pct) {
+    const lbl = document.getElementById(`aux-${idx}-${auxIdx}`);
+    if (lbl) lbl.textContent = `${Math.round(pct)}%`;
+    sendCmd({ type: 'set_aux_send', strip: idx, aux_idx: auxIdx, level: pct / 100 });
+  }
+  function toggleSolo(idx) {
+    if (!state?.strips[idx]) return;
+    const next = !state.strips[idx].solo;
+    state.strips[idx].solo = next;
+    sendCmd({ type: 'set_solo', strip: idx, solo: next });
+    renderStateSync();
+  }
+  function toggleMute(idx) {
+    if (!state?.strips[idx]) return;
+    const next = !state.strips[idx].mute;
+    state.strips[idx].mute = next;
+    sendCmd({ type: 'set_mute', strip: idx, mute: next });
+    renderStateSync();
+  }
+
+  function openPluginModal(stripIdx, slotIdx) {
+    modalTarget = { stripIdx, slotIdx };
+    renderPluginModal();
+    document.getElementById('pluginModalBg').classList.add('open');
+  }
+  function closePluginModal() {
+    modalTarget = null;
+    document.getElementById('pluginModalBg').classList.remove('open');
+  }
+  function renderPluginModal() {
+    if (!modalTarget || !state) return;
+    const st = state.strips[modalTarget.stripIdx];
+    const slot = st?.inserts?.[modalTarget.slotIdx];
+    if (!slot || !slot.plugin) { closePluginModal(); return; }
+    document.getElementById('pmTitle').textContent = `${st.name} · ${slot.plugin.name}`;
+    const body = document.getElementById('pmBody');
+    const bypBtn = `<button class="${slot.bypassed ? '' : 'active-emerald'}" onclick="sendCmd({type:'bypass_insert',strip:${modalTarget.stripIdx},slot:${modalTarget.slotIdx},bypassed:${!slot.bypassed}})">${slot.bypassed ? 'Plugin Bypassé (Activer)' : 'Plugin Actif (Bypass)'}</button>`;
+    const paramsHtml = (slot.params || []).map(p => `
+      <div class="slider-row">
+        <div class="slider-lbl"><span>${esc(p.name)}</span><span id="pm-v-${p.id}">${p.value.toFixed(2)} ${esc(p.unit || '')}</span></div>
+        <input type="range" min="${p.min}" max="${p.max}" step="${(p.max - p.min) / 200}" value="${p.value}"
+          onpointerdown="activeDragKey='pm-${p.id}'" onpointerup="activeDragKey=null"
+          oninput="document.getElementById('pm-v-${p.id}').textContent=Number(this.value).toFixed(2)+' ${esc(p.unit || '')}'; sendCmd({type:'set_plugin_param',strip:${modalTarget.stripIdx},slot:${modalTarget.slotIdx},param_id:${p.id},value:Number(this.value)})" />
+      </div>`).join('');
+    body.innerHTML = bypBtn + (paramsHtml || `<div class="strip-sub">Aucun paramètre exposé</div>`);
+  }
+
+  // Player controls
+  const plSeekEl = document.getElementById('plSeek');
+  plSeekEl.addEventListener('pointerdown', () => { activeDragKey = 'pl-seek'; });
+  plSeekEl.addEventListener('pointerup', () => { activeDragKey = null; });
+  plSeekEl.addEventListener('input', (e) => {
+    sendCmd({ type: 'player_seek', pos_secs: Number(e.target.value) });
+  });
+  const plGainEl = document.getElementById('plGain');
+  plGainEl.addEventListener('pointerdown', () => { activeDragKey = 'pl-gain'; });
+  plGainEl.addEventListener('pointerup', () => { activeDragKey = null; });
+  plGainEl.addEventListener('input', (e) => {
+    sendCmd({ type: 'player_set_gain', gain: Number(e.target.value) });
+  });
+  document.getElementById('plTarget').addEventListener('change', (e) => {
+    const val = e.target.value === '' ? null : Number(e.target.value);
+    sendCmd({ type: 'player_set_target', target: val });
+  });
+
+  connectWS();
+</script>
+</body>
+</html>

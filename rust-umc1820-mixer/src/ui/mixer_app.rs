@@ -9,6 +9,9 @@ use crate::audio::state::{
     OutputTargetRoute, PlayerProgress, PluginFormat, StripKind, StripState, MAX_AUX_PAIRS,
     MAX_INSERTS_PER_STRIP, NUM_AUX_STRIPS, NUM_INPUT_STRIPS, TOTAL_STRIPS,
 };
+use crate::remote::{
+    RemoteCommand, RemoteMeterEntry, RemoteMetersPacket, RemotePlayerProgressView, RemoteServer,
+};
 use crate::ui::file_dialog::{pick_open_file, pick_save_file};
 use crate::ui::native_editor::NativeEditorManager;
 use crate::ui::widgets::{push_button, rotary_knob, vertical_fader, vu_meter};
@@ -17,6 +20,7 @@ use egui::Color32;
 use ringbuf::traits::{Consumer, Producer};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiScaleMode {
@@ -110,6 +114,12 @@ pub struct UmcMixerApp {
     player_loop: bool,
     player_gain: f32,
     player_target: Option<usize>,
+    // Serveur télécommande iPad (HTTP + WebSocket + OSC)
+    remote_server: Option<RemoteServer>,
+    remote_error: Option<String>,
+    remote_state_dirty: bool,
+    last_state_broadcast: Instant,
+    last_meter_broadcast: Instant,
 }
 
 impl Drop for UmcMixerApp {
@@ -140,6 +150,11 @@ impl UmcMixerApp {
             .map(|e| e.device_name.clone())
             .unwrap_or_else(|| "Aucun périphérique".into());
 
+        let (remote_server, remote_error) = match RemoteServer::start() {
+            Ok(srv) => (Some(srv), None),
+            Err(e) => (None, Some(e)),
+        };
+
         let mut app = Self {
             strips,
             aux_pair_stereo: [true; MAX_AUX_PAIRS],
@@ -168,6 +183,11 @@ impl UmcMixerApp {
             player_loop: false,
             player_gain: 1.0,
             player_target: None,
+            remote_server,
+            remote_error,
+            remote_state_dirty: true,
+            last_state_broadcast: Instant::now(),
+            last_meter_broadcast: Instant::now(),
         };
         app.sync_all_state_to_engine(false);
         app
@@ -177,6 +197,7 @@ impl UmcMixerApp {
         if let Some(eng) = self.engine.as_mut() {
             let _ = eng.command_tx.try_push(cmd);
         }
+        self.remote_state_dirty = true;
     }
 
     fn sync_all_state_to_engine(&mut self, reinstall_plugins: bool) {
@@ -589,6 +610,222 @@ impl UmcMixerApp {
         }
         res
     }
+
+    fn build_remote_state_json(&self) -> String {
+        #[derive(serde::Serialize)]
+        struct RemotePlayerFull<'a> {
+            title: &'a str,
+            playing: bool,
+            pos_secs: f32,
+            duration_secs: f32,
+            loop_enabled: bool,
+            gain: f32,
+            target: Option<usize>,
+        }
+
+        #[derive(serde::Serialize)]
+        struct RemoteStatePacket<'a> {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            device: &'a str,
+            sample_rate: u32,
+            in_channels: usize,
+            out_channels: usize,
+            aux_pair_stereo: [bool; MAX_AUX_PAIRS],
+            strips: &'a [StripState],
+            player: RemotePlayerFull<'a>,
+        }
+
+        let (sr, in_ch, out_ch) = self
+            .engine
+            .as_ref()
+            .map(|e| (e.sample_rate, e.in_channels, e.out_channels))
+            .unwrap_or((48000, 8, 10));
+
+        let pkt = RemoteStatePacket {
+            kind: "state",
+            device: &self.selected_device,
+            sample_rate: sr,
+            in_channels: in_ch,
+            out_channels: out_ch,
+            aux_pair_stereo: self.aux_pair_stereo,
+            strips: &self.strips,
+            player: RemotePlayerFull {
+                title: &self.player_title,
+                playing: self.player_progress.playing,
+                pos_secs: self.player_progress.pos_secs,
+                duration_secs: self.player_progress.duration_secs,
+                loop_enabled: self.player_loop,
+                gain: self.player_gain,
+                target: self.player_target,
+            },
+        };
+        serde_json::to_string(&pkt).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    fn apply_remote_command(&mut self, cmd: RemoteCommand) {
+        match cmd {
+            RemoteCommand::RequestState => {
+                self.remote_state_dirty = true;
+            }
+            RemoteCommand::SetVolume { strip, volume_db } => {
+                if strip < self.strips.len() {
+                    let v = volume_db.clamp(-60.0, 12.0);
+                    self.strips[strip].volume_db = v;
+                    self.send(MixerCommand::SetVolume { strip, volume_db: v });
+                }
+            }
+            RemoteCommand::SetGain { strip, gain_db } => {
+                if strip < self.strips.len() && self.strips[strip].kind == StripKind::Input {
+                    let g = gain_db.clamp(-12.0, 24.0);
+                    self.strips[strip].gain_db = g;
+                    self.send(MixerCommand::SetGain { strip, gain_db: g });
+                }
+            }
+            RemoteCommand::SetMute { strip, mute } => {
+                if strip < self.strips.len() {
+                    self.strips[strip].mute = mute;
+                    self.send(MixerCommand::SetMute { strip, mute });
+                }
+            }
+            RemoteCommand::SetSolo { strip, solo } => {
+                if strip < self.strips.len() && self.strips[strip].kind != StripKind::Master {
+                    self.strips[strip].solo = solo;
+                    self.send(MixerCommand::SetSolo { strip, solo });
+                }
+            }
+            RemoteCommand::ClearAllSolo => {
+                for s_idx in 0..self.strips.len() {
+                    if self.strips[s_idx].solo {
+                        self.strips[s_idx].solo = false;
+                        self.send(MixerCommand::SetSolo { strip: s_idx, solo: false });
+                    }
+                }
+            }
+            RemoteCommand::SetEqBand { strip, band, value_db } => {
+                if strip < self.strips.len() {
+                    let db = value_db.clamp(-15.0, 15.0);
+                    let eq = &mut self.strips[strip].eq;
+                    match band.as_str() {
+                        "low" => eq.low_db = db,
+                        "low_mid" => eq.low_mid_db = db,
+                        "mid" => eq.mid_db = db,
+                        "high_mid" => eq.high_mid_db = db,
+                        "high" => eq.high_db = db,
+                        _ => return,
+                    }
+                    let eq_copy = *eq;
+                    self.send(MixerCommand::SetEq { strip, eq: eq_copy });
+                }
+            }
+            RemoteCommand::SetEqBypass { strip, bypassed } => {
+                if strip < self.strips.len() {
+                    self.strips[strip].eq.bypassed = bypassed;
+                    let eq_copy = self.strips[strip].eq;
+                    self.send(MixerCommand::SetEq { strip, eq: eq_copy });
+                }
+            }
+            RemoteCommand::SetAuxSend { strip, aux_idx, level } => {
+                if strip < self.strips.len()
+                    && self.strips[strip].kind != StripKind::Master
+                    && aux_idx < NUM_AUX_STRIPS
+                {
+                    let lvl = level.clamp(0.0, 1.0);
+                    self.strips[strip].aux_sends[aux_idx] = lvl;
+                    self.send(MixerCommand::SetAuxSend { strip, aux_idx, level: lvl });
+                }
+            }
+            RemoteCommand::SetAuxPairStereo { pair, stereo } => {
+                self.toggle_aux_pair_stereo(pair, stereo);
+            }
+            RemoteCommand::SetInputRoute { strip, kind, channel } => {
+                if strip < self.strips.len() && self.strips[strip].kind == StripKind::Input {
+                    let route = match kind.as_str() {
+                        "mono" => InputSourceRoute::Mono(channel),
+                        "stereo" => InputSourceRoute::StereoPair(channel),
+                        _ => InputSourceRoute::None,
+                    };
+                    self.strips[strip].input_route = route;
+                    self.send(MixerCommand::SetInputRoute { strip, route });
+                }
+            }
+            RemoteCommand::SetOutputRoute { strip, kind, channel } => {
+                if strip < self.strips.len() && self.strips[strip].kind != StripKind::Input {
+                    let route = match kind.as_str() {
+                        "master" if self.strips[strip].kind == StripKind::Aux => {
+                            OutputTargetRoute::MasterBus
+                        }
+                        "mono" => OutputTargetRoute::Mono(channel),
+                        "stereo" => OutputTargetRoute::StereoPair(channel),
+                        _ => OutputTargetRoute::None,
+                    };
+                    self.strips[strip].output_route = route;
+                    self.send(MixerCommand::SetOutputRoute { strip, route });
+                }
+            }
+            RemoteCommand::SetStripMidiMode { strip, mode } => {
+                if strip < self.strips.len() {
+                    self.strips[strip].midi_mode = mode;
+                    self.send(MixerCommand::SetStripMidiMode { strip, mode });
+                }
+            }
+            RemoteCommand::BypassInsert { strip, slot, bypassed } => {
+                if strip < self.strips.len() && slot < MAX_INSERTS_PER_STRIP {
+                    self.strips[strip].inserts[slot].bypassed = bypassed;
+                    self.send(MixerCommand::BypassInsert { strip, slot, bypassed });
+                }
+            }
+            RemoteCommand::SetPluginParam { strip, slot, param_id, value } => {
+                if strip < self.strips.len() && slot < MAX_INSERTS_PER_STRIP {
+                    if let Some(p) = self.strips[strip].inserts[slot]
+                        .params
+                        .iter_mut()
+                        .find(|p| p.id == param_id)
+                    {
+                        let clamped = value.clamp(p.min, p.max);
+                        p.value = clamped;
+                        let p_min = p.min;
+                        let p_max = p.max;
+                        if let Some(NativePluginHandle::Vst3 { controller_ptr, .. }) =
+                            self.native_handles[strip][slot].as_ref()
+                        {
+                            let norm = f64::from(
+                                ((clamped - p_min) / (p_max - p_min).max(1e-6)).clamp(0.0, 1.0),
+                            );
+                            self.native_editors
+                                .sync_vst3_param_normalized(*controller_ptr, param_id, norm);
+                        }
+                        self.send(MixerCommand::SetPluginParam {
+                            strip,
+                            slot,
+                            param_id,
+                            value: clamped,
+                        });
+                    }
+                }
+            }
+            RemoteCommand::PlayerPlay => self.send(MixerCommand::PlayerPlay),
+            RemoteCommand::PlayerPause => self.send(MixerCommand::PlayerPause),
+            RemoteCommand::PlayerStop => self.send(MixerCommand::PlayerStop),
+            RemoteCommand::PlayerSeek { pos_secs } => {
+                self.send(MixerCommand::PlayerSeek(pos_secs.max(0.0)));
+            }
+            RemoteCommand::PlayerSetLoop { loop_enabled } => {
+                self.player_loop = loop_enabled;
+                self.send(MixerCommand::PlayerSetLoop(loop_enabled));
+            }
+            RemoteCommand::PlayerSetGain { gain } => {
+                let g = gain.clamp(0.0, 2.0);
+                self.player_gain = g;
+                self.send(MixerCommand::PlayerSetGain(g));
+            }
+            RemoteCommand::PlayerSetTarget { target } => {
+                let t = target.filter(|&i| i < NUM_INPUT_STRIPS);
+                self.player_target = t;
+                self.send(MixerCommand::PlayerSetTarget(t));
+            }
+        }
+    }
 }
 
 impl eframe::App for UmcMixerApp {
@@ -607,6 +844,13 @@ impl eframe::App for UmcMixerApp {
             }
             while let Some(_retired_track) = eng.retired_track_rx.try_pop() {
                 // Libéré proprement sur le thread UI principal
+            }
+        }
+
+        if let Some(srv) = self.remote_server.as_ref() {
+            let cmds = srv.poll_commands();
+            for cmd in cmds {
+                self.apply_remote_command(cmd);
             }
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -747,6 +991,47 @@ impl eframe::App for UmcMixerApp {
                     self.discovered_plugins = scan_system_plugins();
                 }
 
+                ui.separator();
+                let remote_active = self.remote_server.is_some();
+                let remote_btn_lbl = if let Some(srv) = self.remote_server.as_ref() {
+                    format!("iPad WS: ON ({})", srv.client_count())
+                } else {
+                    "iPad WS: OFF".to_string()
+                };
+                if ui.button(remote_btn_lbl).clicked() {
+                    if remote_active {
+                        self.remote_server = None;
+                    } else {
+                        match RemoteServer::start() {
+                            Ok(srv) => {
+                                self.remote_server = Some(srv);
+                                self.remote_error = None;
+                                self.remote_state_dirty = true;
+                            }
+                            Err(e) => self.remote_error = Some(e),
+                        }
+                    }
+                }
+                if let Some(srv) = self.remote_server.as_ref() {
+                    let url = srv.url();
+                    if ui
+                        .small_button(egui::RichText::new(&url).monospace().color(Color32::from_rgb(56, 189, 248)))
+                        .on_hover_text("Ouvrir cette adresse dans Safari sur iPad (cliquer pour copier)")
+                        .clicked()
+                    {
+                        ctx.copy_text(url.clone());
+                        self.status_info = Some(format!("Adresse iPad copiée : {url}"));
+                    }
+                    if let Some(osc_p) = srv.osc_port {
+                        ui.label(
+                            egui::RichText::new(format!("OSC:{osc_p}"))
+                                .monospace()
+                                .size(10.5)
+                                .color(Color32::GRAY),
+                        );
+                    }
+                }
+
                 if let Some(eng) = &self.engine {
                     ui.label(
                         egui::RichText::new(format!(
@@ -759,6 +1044,8 @@ impl eframe::App for UmcMixerApp {
                 }
                 if let Some(err) = &self.status_error {
                     ui.colored_label(Color32::from_rgb(239, 68, 68), err);
+                } else if let Some(rerr) = &self.remote_error {
+                    ui.colored_label(Color32::from_rgb(245, 158, 11), rerr);
                 } else if let Some(info) = &self.status_info {
                     ui.colored_label(Color32::from_rgb(16, 185, 129), info);
                 }
@@ -879,6 +1166,55 @@ impl eframe::App for UmcMixerApp {
         });
 
         self.draw_plugin_picker_modal(ctx);
+
+        // Diffusion temps réel vers les navigateurs iPad connectés (état + VU-mètres 20 Hz)
+        if self.remote_server.is_some() {
+            if self.remote_state_dirty
+                && self.last_state_broadcast.elapsed() >= Duration::from_millis(35)
+            {
+                let json = self.build_remote_state_json();
+                if let Some(srv) = self.remote_server.as_ref() {
+                    srv.broadcast_state(json);
+                }
+                self.remote_state_dirty = false;
+                self.last_state_broadcast = Instant::now();
+            }
+
+            if self
+                .remote_server
+                .as_ref()
+                .map(|s| s.client_count() > 0)
+                .unwrap_or(false)
+                && self.last_meter_broadcast.elapsed() >= Duration::from_millis(50)
+            {
+                let meter_entries: Vec<RemoteMeterEntry> = self
+                    .meters
+                    .iter()
+                    .map(|m| RemoteMeterEntry {
+                        pl: (m.peak_l * 10.0).round() / 10.0,
+                        pr: (m.peak_r * 10.0).round() / 10.0,
+                        rl: (m.rms_l * 10.0).round() / 10.0,
+                        rr: (m.rms_r * 10.0).round() / 10.0,
+                        clip: m.clip,
+                    })
+                    .collect();
+                let packet = RemoteMetersPacket {
+                    kind: "meters",
+                    meters: &meter_entries,
+                    player: RemotePlayerProgressView {
+                        playing: self.player_progress.playing,
+                        pos_secs: self.player_progress.pos_secs,
+                        duration_secs: self.player_progress.duration_secs,
+                    },
+                };
+                if let Ok(json) = serde_json::to_string(&packet) {
+                    if let Some(srv) = self.remote_server.as_ref() {
+                        srv.broadcast_meters(&json);
+                    }
+                }
+                self.last_meter_broadcast = Instant::now();
+            }
+        }
     }
 }
 
