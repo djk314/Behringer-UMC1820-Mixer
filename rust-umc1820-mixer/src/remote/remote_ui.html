@@ -460,6 +460,18 @@
     return 'none:0';
   }
 
+  function encodeMidiDevice(d) {
+    if (!d || d === 'All') return 'all';
+    if (d === 'None') return 'none';
+    if (d.Port !== undefined) return String(d.Port);
+    return 'all';
+  }
+
+  function encodeMidiMode(m) {
+    if (m === null || m === undefined) return 'off';
+    return String(m);
+  }
+
   function renderMixer() {
     if (!state) return;
     const container = document.getElementById('mixerScroll');
@@ -497,6 +509,16 @@
         ioHtml = `<select class="io-select out-select" onchange="onOutputRoute(${idx}, this.value)">${outOpts}</select>`;
       }
 
+      const midiPorts = Array.isArray(state.midi_ports) ? state.midi_ports : [];
+      const curMidiDev = encodeMidiDevice(st.midi_device);
+      let midiDevOpts = `<option value="all">MIDI: Tous</option><option value="none">MIDI: Aucun</option>`;
+      midiPorts.forEach((p) => { midiDevOpts += `<option value="${esc(p)}">MIDI: ${esc(p)}</option>`; });
+      if (curMidiDev !== 'all' && curMidiDev !== 'none' && !midiPorts.includes(curMidiDev)) {
+        midiDevOpts += `<option value="${esc(curMidiDev)}">MIDI: ${esc(curMidiDev)}</option>`;
+      }
+      let midiChOpts = `<option value="off">Canal: OFF</option><option value="0">Canal: OMNI</option>`;
+      for (let ch = 1; ch <= 16; ch++) midiChOpts += `<option value="${ch}">Canal: CH ${ch}</option>`;
+
       const topCtrlHtml = isInput
         ? `<div class="sec">
              <button class="${isInStereo ? 'active-sky' : 'active-emerald'}" style="padding:4px;font-size:10px;"
@@ -510,6 +532,8 @@
                  ondblclick="onGain(${idx},0);this.value=0"
                  oninput="onGain(${idx}, Number(this.value))" />
              </div>
+             <select class="io-select midi-dev-select" onchange="onMidiDevice(${idx}, this.value)">${midiDevOpts}</select>
+             <select class="io-select midi-ch-select" onchange="onMidiMode(${idx}, this.value)">${midiChOpts}</select>
            </div>`
         : isAux
           ? `<div class="sec">
@@ -623,7 +647,7 @@
         </section>`;
     }).join('');
 
-    // Restore selected I/O values & attach touch fader listeners
+    // Restore selected I/O & MIDI values & attach touch fader listeners
     indices.forEach((idx) => {
       const st = state.strips[idx];
       const sec = container.querySelector(`#fader-${idx}`)?.closest('.strip');
@@ -632,6 +656,10 @@
         if (inSel) inSel.value = encodeInputRoute(st.input_route);
         const outSel = sec.querySelector('.out-select');
         if (outSel) outSel.value = encodeOutputRoute(st.output_route);
+        const midiDevSel = sec.querySelector('.midi-dev-select');
+        if (midiDevSel) midiDevSel.value = encodeMidiDevice(st.midi_device);
+        const midiChSel = sec.querySelector('.midi-ch-select');
+        if (midiChSel) midiChSel.value = encodeMidiMode(st.midi_mode);
       }
       attachFaderTouch(idx);
     });
@@ -692,6 +720,17 @@
   function onOutputRoute(idx, val) {
     const [kind, ch] = val.split(':');
     sendCmd({ type: 'set_output_route', strip: idx, kind, channel: Number(ch) || 0 });
+  }
+  function onMidiDevice(idx, val) {
+    if (state?.strips[idx]) {
+      state.strips[idx].midi_device = val === 'all' ? 'All' : val === 'none' ? 'None' : { Port: val };
+    }
+    sendCmd({ type: 'set_strip_midi_device', strip: idx, device: val });
+  }
+  function onMidiMode(idx, val) {
+    const mode = val === 'off' ? null : Number(val);
+    if (state?.strips[idx]) state.strips[idx].midi_mode = mode;
+    sendCmd({ type: 'set_strip_midi_mode', strip: idx, mode });
   }
   function onGain(idx, db) {
     if (state?.strips[idx]) state.strips[idx].gain_db = db;

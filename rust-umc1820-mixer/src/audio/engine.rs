@@ -2,8 +2,8 @@ use super::dsp::{db_to_linear, BallisticMeter, FiveBandEqProcessor};
 use super::player::DecodedAudioTrack;
 use super::plugin_host::{HostedPlugin, StripInsertRack};
 use super::state::{
-    InputSourceRoute, MeterFrame, MidiMessage, MixerCommand, OutputTargetRoute, PlayerProgress,
-    StripKind, StripState, MAX_AUX_PAIRS, MAX_INPUT_PAIRS, MAX_INSERTS_PER_STRIP,
+    InputSourceRoute, MeterFrame, MidiMessage, MidiPortFilter, MixerCommand, OutputTargetRoute,
+    PlayerProgress, StripKind, StripState, MAX_AUX_PAIRS, MAX_INPUT_PAIRS, MAX_INSERTS_PER_STRIP,
     NUM_AUX_STRIPS, NUM_INPUT_STRIPS, TOTAL_STRIPS,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -39,6 +39,7 @@ struct StripDspRuntime {
     mute: bool,
     solo: bool,
     midi_mode: Option<u8>,
+    midi_port_filter: MidiPortFilter,
     aux_sends: [f32; NUM_AUX_STRIPS],
     eq: FiveBandEqProcessor,
     inserts: StripInsertRack,
@@ -83,6 +84,11 @@ impl StripDspRuntime {
             mute: false,
             solo: false,
             midi_mode: if kind == StripKind::Input { Some(0) } else { None },
+            midi_port_filter: if kind == StripKind::Input {
+                MidiPortFilter::All
+            } else {
+                MidiPortFilter::None
+            },
             aux_sends: [0.0; NUM_AUX_STRIPS],
             eq: FiveBandEqProcessor::default(),
             inserts: StripInsertRack::default(),
@@ -162,21 +168,28 @@ impl PlayerRuntime {
 
 #[inline]
 fn filter_midi_for_strip(
+    port_filter: MidiPortFilter,
     mode: Option<u8>,
     src: &[MidiMessage],
     dst: &mut [MidiMessage; 128],
 ) -> usize {
+    if port_filter == MidiPortFilter::None {
+        return 0;
+    }
     let Some(target) = mode else {
         return 0;
     };
-    if target == 0 {
-        let n = src.len().min(128);
-        dst[..n].copy_from_slice(&src[..n]);
-        return n;
-    }
     let mut n = 0;
     for &m in src {
-        if m.channel() == Some(target) {
+        let port_ok = match port_filter {
+            MidiPortFilter::All => true,
+            MidiPortFilter::None => false,
+            MidiPortFilter::PortIndex(id) => m.port_id == id,
+        };
+        if !port_ok {
+            continue;
+        }
+        if target == 0 || m.channel() == Some(target) {
             dst[n] = m;
             n += 1;
             if n == 128 {
@@ -467,8 +480,13 @@ pub fn start_audio_engine(
                         }
                     }
                     MixerCommand::SetStripMidiMode { strip, mode } => {
-                        if strip < TOTAL_STRIPS {
+                        if strip < NUM_INPUT_STRIPS {
                             st.runtimes[strip].midi_mode = mode;
+                        }
+                    }
+                    MixerCommand::SetStripMidiDevice { strip, filter } => {
+                        if strip < NUM_INPUT_STRIPS {
+                            st.runtimes[strip].midi_port_filter = filter;
                         }
                     }
                     MixerCommand::InstallInsert { strip, slot, plugin } => {
@@ -629,8 +647,12 @@ pub fn start_audio_engine(
                         st.block_r[f] = in_r * trim;
                     }
 
-                    let n_midi =
-                        filter_midi_for_strip(rt.midi_mode, &midi_buf[..midi_count], &mut strip_midi);
+                    let n_midi = filter_midi_for_strip(
+                        rt.midi_port_filter,
+                        rt.midi_mode,
+                        &midi_buf[..midi_count],
+                        &mut strip_midi,
+                    );
                     rt.inserts.process_with_midi(
                         &mut st.block_l[..frames],
                         &mut st.block_r[..frames],
@@ -702,15 +724,10 @@ pub fn start_audio_engine(
                         st.block_r[f] = st.aux_bus_r[aux_i][f];
                     }
 
-                    let n_midi = filter_midi_for_strip(
-                        rt.midi_mode,
-                        &midi_buf[..midi_count],
-                        &mut strip_midi,
-                    );
                     rt.inserts.process_with_midi(
                         &mut st.block_l[..frames],
                         &mut st.block_r[..frames],
-                        &strip_midi[..n_midi],
+                        &[],
                     );
 
                     let audible = if any_solo { rt.solo && !rt.mute } else { !rt.mute };
@@ -742,16 +759,14 @@ pub fn start_audio_engine(
                 }
             }
 
-            // 4. Traitement de la tranche Master (SANS Gain et SANS Solo)
+            // 4. Traitement de la tranche Master (SANS Gain, SANS Solo et SANS MIDI)
             let master_idx = NUM_INPUT_STRIPS + NUM_AUX_STRIPS;
             {
                 let rt = &mut st.runtimes[master_idx];
-                let n_midi =
-                    filter_midi_for_strip(rt.midi_mode, &midi_buf[..midi_count], &mut strip_midi);
                 rt.inserts.process_with_midi(
                     &mut st.master_l[..frames],
                     &mut st.master_r[..frames],
-                    &strip_midi[..n_midi],
+                    &[],
                 );
                 let fader = if !rt.mute { db_to_linear(rt.volume_db) } else { 0.0 };
 

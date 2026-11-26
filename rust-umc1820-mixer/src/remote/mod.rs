@@ -27,6 +27,7 @@ pub enum RemoteCommand {
     SetInputRoute { strip: usize, kind: String, channel: usize },
     SetOutputRoute { strip: usize, kind: String, channel: usize },
     SetStripMidiMode { strip: usize, mode: Option<u8> },
+    SetStripMidiDevice { strip: usize, device: String },
     BypassInsert { strip: usize, slot: usize, bypassed: bool },
     SetPluginParam { strip: usize, slot: usize, param_id: u32, value: f32 },
     PlayerPlay,

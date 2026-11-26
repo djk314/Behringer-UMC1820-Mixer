@@ -248,6 +248,10 @@ export class WebAudioMixerEngine {
   private playerTargetStripId: string | null = null;
 
   private bufferFrames = 128;
+  private midiVoices = new Map<
+    string,
+    { osc: OscillatorNode; gain: GainNode; stripId: string }
+  >();
 
   public isRunning(): boolean {
     return this.running && this.ctx?.state === 'running';
@@ -298,6 +302,7 @@ export class WebAudioMixerEngine {
     const savedOffset = this.getPlayerStatus().posSecs;
 
     this.teardownPlayerSource();
+    this.stopAllMidiVoices();
     for (const chain of this.chains.values()) {
       if (chain.sourceStopper) {
         chain.sourceStopper();
@@ -963,5 +968,117 @@ export class WebAudioMixerEngine {
       };
     }
     return result;
+  }
+
+  public stopAllMidiVoices() {
+    if (!this.ctx) {
+      this.midiVoices.clear();
+      return;
+    }
+    const now = this.ctx.currentTime;
+    for (const voice of this.midiVoices.values()) {
+      try {
+        voice.gain.gain.cancelScheduledValues(now);
+        voice.gain.gain.setTargetAtTime(0.0001, now, 0.015);
+        voice.osc.stop(now + 0.05);
+      } catch {
+        // ignore
+      }
+    }
+    this.midiVoices.clear();
+  }
+
+  public handleMidiMessage(
+    data: Uint8Array,
+    portName: string,
+    strips: StripState[],
+    inputPairStereo: InputPairStereoState
+  ) {
+    if (!this.ctx || this.ctx.state !== 'running' || data.length < 2) return;
+    const status = data[0];
+    if (status >= 0xf0) return;
+    const msgType = status & 0xf0;
+    const msgCh = (status & 0x0f) + 1; // 1..16
+    const d1 = data[1] ?? 0;
+    const d2 = data[2] ?? 0;
+
+    // Only Input strips can receive MIDI (Aux and Master never receive MIDI)
+    const matchingInputStrips = strips.filter((st) => {
+      if (st.kind !== 'input') return false;
+      const pairIdx = Math.floor(st.index / 2);
+      const isSecondary = (inputPairStereo[pairIdx] ?? true) && st.index % 2 === 1;
+      if (isSecondary) return false;
+
+      if (st.midiDevice === 'none') return false;
+      if (st.midiDevice !== 'all' && st.midiDevice !== portName) return false;
+
+      if (st.midiChannel === null || st.midiChannel === undefined) return false;
+      if (st.midiChannel !== 0 && st.midiChannel !== msgCh) return false;
+      return true;
+    });
+
+    if (matchingInputStrips.length === 0) return;
+    const now = this.ctx.currentTime;
+
+    if (msgType === 0x90 && d2 > 0) {
+      const freq = 440 * Math.pow(2, (d1 - 69) / 12);
+      const amp = Math.max(0.03, (d2 / 127) * 0.24);
+      for (const st of matchingInputStrips) {
+        const chain = this.chains.get(st.id);
+        if (!chain) continue;
+        const voiceKey = `${st.id}:${msgCh}:${d1}`;
+        const existing = this.midiVoices.get(voiceKey);
+        if (existing) {
+          try {
+            existing.gain.gain.cancelScheduledValues(now);
+            existing.gain.gain.setTargetAtTime(0.0001, now, 0.01);
+            existing.osc.stop(now + 0.03);
+          } catch {
+            // ignore
+          }
+          this.midiVoices.delete(voiceKey);
+        }
+        const osc = this.ctx.createOscillator();
+        const g = this.ctx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(freq, now);
+        g.gain.setValueAtTime(0.0001, now);
+        g.gain.linearRampToValueAtTime(amp, now + 0.01);
+        osc.connect(g);
+        g.connect(chain.inputSum);
+        osc.start(now);
+        this.midiVoices.set(voiceKey, { osc, gain: g, stripId: st.id });
+      }
+    } else if (msgType === 0x80 || (msgType === 0x90 && d2 === 0)) {
+      for (const st of matchingInputStrips) {
+        const voiceKey = `${st.id}:${msgCh}:${d1}`;
+        const existing = this.midiVoices.get(voiceKey);
+        if (existing) {
+          try {
+            existing.gain.gain.cancelScheduledValues(now);
+            existing.gain.gain.setTargetAtTime(0.0001, now, 0.025);
+            existing.osc.stop(now + 0.12);
+          } catch {
+            // ignore
+          }
+          this.midiVoices.delete(voiceKey);
+        }
+      }
+    } else if (msgType === 0xb0 && (d1 === 120 || d1 === 123)) {
+      for (const st of matchingInputStrips) {
+        for (const [k, v] of this.midiVoices.entries()) {
+          if (v.stripId === st.id) {
+            try {
+              v.gain.gain.cancelScheduledValues(now);
+              v.gain.gain.setTargetAtTime(0.0001, now, 0.015);
+              v.osc.stop(now + 0.06);
+            } catch {
+              // ignore
+            }
+            this.midiVoices.delete(k);
+          }
+        }
+      }
+    }
   }
 }

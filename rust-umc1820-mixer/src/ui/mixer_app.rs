@@ -1,13 +1,14 @@
 use crate::audio::engine::{
     default_mixer_strips, list_audio_devices, start_audio_engine, AudioEngineHandle,
 };
-use crate::audio::midi::{MidiInputManager, MidiPortSelection};
+use crate::audio::midi::MidiInputManager;
 use crate::audio::player::decode_audio_file;
 use crate::audio::plugin_host::{instantiate_plugin, scan_system_plugins, HostedPlugin};
 use crate::audio::state::{
     DiscoveredPlugin, InputSourceRoute, MeterFrame, MixerCommand, MixerSetFile, NativePluginHandle,
-    OutputTargetRoute, PlayerProgress, PluginFormat, StripKind, StripState, MAX_AUX_PAIRS,
-    MAX_INPUT_PAIRS, MAX_INSERTS_PER_STRIP, NUM_AUX_STRIPS, NUM_INPUT_STRIPS, TOTAL_STRIPS,
+    OutputTargetRoute, PlayerProgress, PluginFormat, StripKind, StripMidiDevice, StripState,
+    MAX_AUX_PAIRS, MAX_INPUT_PAIRS, MAX_INSERTS_PER_STRIP, NUM_AUX_STRIPS, NUM_INPUT_STRIPS,
+    TOTAL_STRIPS,
 };
 use crate::remote::{
     RemoteCommand, RemoteMeterEntry, RemoteMetersPacket, RemotePlayerProgressView, RemoteServer,
@@ -136,6 +137,7 @@ pub struct UmcMixerApp {
     native_ppp: Option<f32>,
     view_filter: StripViewFilter,
     input_bank: InputBankFilter,
+    show_player_bar: bool,
     status_error: Option<String>,
     status_info: Option<String>,
     // Lecteur audio MP3 / WAV
@@ -212,6 +214,7 @@ impl UmcMixerApp {
             native_ppp: None,
             view_filter: StripViewFilter::All,
             input_bank: InputBankFilter::All,
+            show_player_bar: true,
             status_error,
             status_info: None,
             player_file_path: None,
@@ -268,6 +271,13 @@ impl UmcMixerApp {
         self.sync_all_state_to_engine(true);
     }
 
+    fn sync_strip_midi_devices(&mut self) {
+        for s_idx in 0..NUM_INPUT_STRIPS {
+            let filter = self.midi_manager.resolve_filter(&self.strips[s_idx].midi_device);
+            self.send(MixerCommand::SetStripMidiDevice { strip: s_idx, filter });
+        }
+    }
+
     fn sync_all_state_to_engine(&mut self, reinstall_plugins: bool) {
         for pair in 0..MAX_INPUT_PAIRS {
             let stereo = self.input_pair_stereo[pair];
@@ -318,10 +328,17 @@ impl UmcMixerApp {
                 strip: s_idx,
                 volume_db: st.volume_db,
             });
-            self.send(MixerCommand::SetStripMidiMode {
-                strip: s_idx,
-                mode: st.midi_mode,
-            });
+            if st.kind == StripKind::Input {
+                self.send(MixerCommand::SetStripMidiMode {
+                    strip: s_idx,
+                    mode: st.midi_mode,
+                });
+                let filter = self.midi_manager.resolve_filter(&st.midi_device);
+                self.send(MixerCommand::SetStripMidiDevice {
+                    strip: s_idx,
+                    filter,
+                });
+            }
 
             if reinstall_plugins {
                 for sl_idx in 0..MAX_INSERTS_PER_STRIP {
@@ -785,6 +802,7 @@ impl UmcMixerApp {
             out_channels: usize,
             input_pair_stereo: [bool; MAX_INPUT_PAIRS],
             aux_pair_stereo: [bool; MAX_AUX_PAIRS],
+            midi_ports: &'a [String],
             strips: &'a [StripState],
             player: RemotePlayerFull<'a>,
         }
@@ -804,6 +822,7 @@ impl UmcMixerApp {
             out_channels: out_ch,
             input_pair_stereo: self.input_pair_stereo,
             aux_pair_stereo: self.aux_pair_stereo,
+            midi_ports: self.midi_manager.ports(),
             strips: &self.strips,
             player: RemotePlayerFull {
                 title: &self.player_title,
@@ -922,9 +941,21 @@ impl UmcMixerApp {
                 }
             }
             RemoteCommand::SetStripMidiMode { strip, mode } => {
-                if strip < self.strips.len() {
+                if strip < self.strips.len() && self.strips[strip].kind == StripKind::Input {
                     self.strips[strip].midi_mode = mode;
                     self.send(MixerCommand::SetStripMidiMode { strip, mode });
+                }
+            }
+            RemoteCommand::SetStripMidiDevice { strip, device } => {
+                if strip < self.strips.len() && self.strips[strip].kind == StripKind::Input {
+                    let dev = match device.as_str() {
+                        "all" | "All" => StripMidiDevice::All,
+                        "none" | "None" => StripMidiDevice::None,
+                        name => StripMidiDevice::Port(name.to_string()),
+                    };
+                    let filter = self.midi_manager.resolve_filter(&dev);
+                    self.strips[strip].midi_device = dev;
+                    self.send(MixerCommand::SetStripMidiDevice { strip, filter });
                 }
             }
             RemoteCommand::BypassInsert { strip, slot, bypassed } => {
@@ -1017,41 +1048,170 @@ impl eframe::App for UmcMixerApp {
         let active_sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48000);
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.heading("UMC1820 Studio Mixer");
+            egui::menu::bar(ui, |ui| {
+                ui.strong(egui::RichText::new("UMC1820 Studio Mixer").color(Color32::from_rgb(245, 158, 11)));
                 ui.separator();
-                egui::ComboBox::from_label("Pilote")
-                    .selected_text(&self.selected_device)
-                    .show_ui(ui, |ui| {
+
+                // Menu Fichier
+                ui.menu_button("Fichier", |ui| {
+                    if ui.button("Sauver le Set (.umcset)...").clicked() {
+                        ui.close_menu();
+                        self.save_set_to_disk();
+                    }
+                    if ui.button("Charger un Set (.umcset)...").clicked() {
+                        ui.close_menu();
+                        self.load_set_from_disk();
+                    }
+                    ui.separator();
+                    if ui.button("Ouvrir audio MP3 / WAV...").clicked() {
+                        ui.close_menu();
+                        if let Some(path) = pick_open_file("Choisir un fichier MP3 ou WAV", &["mp3", "wav"]) {
+                            self.load_audio_file_from_path(&path);
+                        }
+                    }
+                    if ui.button("Rescanner les Plugins (AU/VST3/VST2)").clicked() {
+                        ui.close_menu();
+                        self.discovered_plugins = scan_system_plugins();
+                        self.status_info = Some(format!("{} plugins détectés", self.discovered_plugins.len()));
+                    }
+                });
+
+                // Menu Audio (Carte son, Latence, Doublement Stéréo/Mono)
+                ui.menu_button("Audio", |ui| {
+                    ui.menu_button(format!("Carte son : {}", self.selected_device), |ui| {
                         for dev in self.devices.clone() {
                             if ui.selectable_label(self.selected_device == dev, &dev).clicked() {
                                 let buf = self.requested_buffer_frames;
                                 self.restart_audio_engine(Some(dev), buf);
+                                ui.close_menu();
                             }
                         }
                     });
+                    let cur_ms = (self.requested_buffer_frames as f32 / active_sr.max(1) as f32) * 1000.0;
+                    ui.menu_button(
+                        format!("Latence : {} smp ({:.1} ms)", self.requested_buffer_frames, cur_ms),
+                        |ui| {
+                            for &buf in &BUFFER_PRESETS {
+                                let ms = (buf as f32 / active_sr.max(1) as f32) * 1000.0;
+                                let lbl = format!("{buf} smp ({ms:.1} ms)");
+                                if ui.selectable_label(self.requested_buffer_frames == buf, lbl).clicked() {
+                                    self.restart_audio_engine(None, buf);
+                                    ui.close_menu();
+                                }
+                            }
+                        },
+                    );
+                    ui.separator();
+                    let all_in_stereo = self.input_pair_stereo.iter().all(|&s| s);
+                    let in_mode_label = if all_in_stereo {
+                        "Entrées : 8 Stéréo → 16 Mono"
+                    } else {
+                        "Entrées : Mono → 8 Stéréo"
+                    };
+                    if ui.button(in_mode_label).clicked() {
+                        let target = !all_in_stereo;
+                        for p in 0..MAX_INPUT_PAIRS {
+                            self.toggle_input_pair_stereo(p, target);
+                        }
+                        if !target && self.input_bank == InputBankFilter::All {
+                            self.input_bank = InputBankFilter::Bank1;
+                        } else if target {
+                            self.input_bank = InputBankFilter::All;
+                        }
+                        ui.close_menu();
+                    }
+                    let all_aux_stereo = self.aux_pair_stereo.iter().all(|&s| s);
+                    let aux_mode_label = if all_aux_stereo {
+                        "Aux : 4 Stéréo → 8 Mono"
+                    } else {
+                        "Aux : Mono → 4 Stéréo"
+                    };
+                    if ui.button(aux_mode_label).clicked() {
+                        let target = !all_aux_stereo;
+                        for p in 0..MAX_AUX_PAIRS {
+                            self.toggle_aux_pair_stereo(p, target);
+                        }
+                        ui.close_menu();
+                    }
+                });
 
-                let cur_ms = (self.requested_buffer_frames as f32 / active_sr.max(1) as f32) * 1000.0;
-                egui::ComboBox::from_label("Latence")
-                    .selected_text(format!("{} smp ({:.1} ms)", self.requested_buffer_frames, cur_ms))
-                    .width(116.0)
-                    .show_ui(ui, |ui| {
-                        for &buf in &BUFFER_PRESETS {
-                            let ms = (buf as f32 / active_sr.max(1) as f32) * 1000.0;
-                            let lbl = format!("{buf} smp ({ms:.1} ms)");
-                            if ui
-                                .selectable_label(self.requested_buffer_frames == buf, lbl)
-                                .clicked()
-                            {
-                                self.restart_audio_engine(None, buf);
+                // Menu MIDI (État global, Rescan, Assignation rapide — sélection fine par piste d'entrée)
+                ui.menu_button("MIDI", |ui| {
+                    let mut midi_en = self.midi_manager.is_enabled();
+                    if ui.checkbox(&mut midi_en, "Activer l'écoute MIDI").changed() {
+                        self.midi_manager.set_enabled(midi_en);
+                        self.sync_strip_midi_devices();
+                    }
+                    if ui.button("Rescanner les ports MIDI").clicked() {
+                        self.midi_manager.refresh_ports();
+                        self.sync_strip_midi_devices();
+                        self.status_info = Some(format!(
+                            "{} port(s) MIDI actif(s)",
+                            self.midi_manager.connected_count()
+                        ));
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    ui.menu_button("Assigner à toutes les pistes d'entrée", |ui| {
+                        if ui.button("Tous les appareils").clicked() {
+                            for s_idx in 0..NUM_INPUT_STRIPS {
+                                self.strips[s_idx].midi_device = StripMidiDevice::All;
+                            }
+                            self.sync_strip_midi_devices();
+                            ui.close_menu();
+                        }
+                        if ui.button("Aucun (Couper MIDI)").clicked() {
+                            for s_idx in 0..NUM_INPUT_STRIPS {
+                                self.strips[s_idx].midi_device = StripMidiDevice::None;
+                            }
+                            self.sync_strip_midi_devices();
+                            ui.close_menu();
+                        }
+                        for port in self.midi_manager.ports().to_vec() {
+                            if ui.button(&port).clicked() {
+                                for s_idx in 0..NUM_INPUT_STRIPS {
+                                    self.strips[s_idx].midi_device = StripMidiDevice::Port(port.clone());
+                                }
+                                self.sync_strip_midi_devices();
+                                ui.close_menu();
                             }
                         }
                     });
+                    ui.separator();
+                    let ports = self.midi_manager.ports();
+                    if ports.is_empty() {
+                        ui.weak("Aucun appareil MIDI détecté");
+                    } else {
+                        ui.label(egui::RichText::new("Appareils détectés :").size(11.0).color(Color32::GRAY));
+                        for p in ports {
+                            ui.label(egui::RichText::new(format!("• {p}")).size(11.0));
+                        }
+                    }
+                    ui.separator();
+                    ui.weak("Chaque piste d'entrée choisit son appareil MIDI en haut de tranche.");
+                });
 
-                egui::ComboBox::from_label("Taille")
-                    .selected_text(self.scale_mode.label())
-                    .width(86.0)
-                    .show_ui(ui, |ui| {
+                // Menu Affichage
+                ui.menu_button("Affichage", |ui| {
+                    ui.menu_button(format!("Vue : {}", self.view_filter.label()), |ui| {
+                        for filter in [
+                            StripViewFilter::All,
+                            StripViewFilter::InputsOnly,
+                            StripViewFilter::BusesOnly,
+                        ] {
+                            ui.selectable_value(&mut self.view_filter, filter, filter.label());
+                        }
+                    });
+                    ui.menu_button(format!("Banque : {}", self.input_bank.label()), |ui| {
+                        for bank in [
+                            InputBankFilter::Bank1,
+                            InputBankFilter::Bank2,
+                            InputBankFilter::All,
+                        ] {
+                            ui.selectable_value(&mut self.input_bank, bank, bank.label());
+                        }
+                    });
+                    ui.menu_button(format!("Taille : {}", self.scale_mode.label()), |ui| {
                         for mode in [
                             UiScaleMode::Auto,
                             UiScaleMode::Scale50,
@@ -1063,180 +1223,104 @@ impl eframe::App for UmcMixerApp {
                             ui.selectable_value(&mut self.scale_mode, mode, mode.label());
                         }
                     });
+                    ui.separator();
+                    ui.checkbox(&mut self.show_player_bar, "Afficher lecteur MP3/WAV");
+                });
 
-                egui::ComboBox::from_label("Vue")
-                    .selected_text(self.view_filter.label())
-                    .width(92.0)
-                    .show_ui(ui, |ui| {
-                        for filter in [
-                            StripViewFilter::All,
-                            StripViewFilter::InputsOnly,
-                            StripViewFilter::BusesOnly,
-                        ] {
-                            ui.selectable_value(&mut self.view_filter, filter, filter.label());
-                        }
-                    });
-
-                let all_in_stereo = self.input_pair_stereo.iter().all(|&s| s);
-                let in_mode_label = if all_in_stereo {
-                    "Entrées: 8 Stéréo → 16 Mono"
+                // Menu Télécommande iPad / OSC
+                let remote_menu_lbl = if self.remote_server.is_some() {
+                    "iPad / OSC ●"
                 } else {
-                    "Entrées: Mono → 8 Stéréo"
+                    "iPad / OSC"
                 };
-                if ui.button(in_mode_label).clicked() {
-                    let target = !all_in_stereo;
-                    for p in 0..MAX_INPUT_PAIRS {
-                        self.toggle_input_pair_stereo(p, target);
-                    }
-                    if !target && self.input_bank == InputBankFilter::All {
-                        self.input_bank = InputBankFilter::Bank1;
-                    } else if target {
-                        self.input_bank = InputBankFilter::All;
-                    }
-                }
-                if ui
-                    .button(self.input_bank.label())
-                    .on_hover_text("Basculer la banque d'entrées affichée (1–8 / 9–16 / Tout)")
-                    .clicked()
-                {
-                    self.input_bank = self.input_bank.next();
-                }
-
-                let all_stereo = self.aux_pair_stereo.iter().all(|&s| s);
-                let aux_mode_label = if all_stereo {
-                    "Aux: 4 Stéréo → Mono"
-                } else {
-                    "Aux: Mono → 4 Stéréo"
-                };
-                if ui.button(aux_mode_label).clicked() {
-                    let target = !all_stereo;
-                    for p in 0..MAX_AUX_PAIRS {
-                        self.toggle_aux_pair_stereo(p, target);
-                    }
-                }
-
-                ui.separator();
-                if ui.button("Sauver Set").clicked() {
-                    self.save_set_to_disk();
-                }
-                if ui.button("Charger Set").clicked() {
-                    self.load_set_from_disk();
-                }
-
-                ui.separator();
-                ui.label("MIDI");
-                let midi_sel_text = match self.midi_manager.selection() {
-                    MidiPortSelection::All => {
-                        format!("Tous ({})", self.midi_manager.connected_count())
-                    }
-                    MidiPortSelection::None => "Aucun".into(),
-                    MidiPortSelection::Port(name) => name.clone(),
-                };
-                egui::ComboBox::from_id_salt("midi_port_combo")
-                    .selected_text(midi_sel_text)
-                    .width(110.0)
-                    .show_ui(ui, |ui| {
-                        let cur = self.midi_manager.selection().clone();
-                        let mut next: Option<MidiPortSelection> = None;
-                        if ui
-                            .selectable_label(
-                                cur == MidiPortSelection::All,
-                                format!("Tous ({})", self.midi_manager.ports().len()),
-                            )
-                            .clicked()
-                        {
-                            next = Some(MidiPortSelection::All);
-                        }
-                        if ui
-                            .selectable_label(cur == MidiPortSelection::None, "Aucun")
-                            .clicked()
-                        {
-                            next = Some(MidiPortSelection::None);
-                        }
-                        for port in self.midi_manager.ports() {
-                            let target = MidiPortSelection::Port(port.clone());
-                            if ui.selectable_label(cur == target, port).clicked() {
-                                next = Some(target);
-                            }
-                        }
-                        if let Some(sel) = next {
-                            self.midi_manager.select(sel);
-                        }
-                    });
-                if ui.button("Rescan MIDI").clicked() {
-                    self.midi_manager.refresh_ports();
-                }
-                if ui.button("Rescanner Plugins").clicked() {
-                    self.discovered_plugins = scan_system_plugins();
-                }
-
-                ui.separator();
-                let remote_active = self.remote_server.is_some();
-                let remote_btn_lbl = if let Some(srv) = self.remote_server.as_ref() {
-                    format!("iPad WS: ON ({})", srv.client_count())
-                } else {
-                    "iPad WS: OFF".to_string()
-                };
-                if ui.button(remote_btn_lbl).clicked() {
-                    if remote_active {
-                        self.remote_server = None;
+                ui.menu_button(remote_menu_lbl, |ui| {
+                    let remote_active = self.remote_server.is_some();
+                    let toggle_lbl = if remote_active {
+                        "Arrêter le serveur iPad"
                     } else {
-                        match RemoteServer::start() {
-                            Ok(srv) => {
-                                self.remote_server = Some(srv);
-                                self.remote_error = None;
-                                self.remote_state_dirty = true;
+                        "Démarrer le serveur iPad"
+                    };
+                    if ui.button(toggle_lbl).clicked() {
+                        if remote_active {
+                            self.remote_server = None;
+                        } else {
+                            match RemoteServer::start() {
+                                Ok(srv) => {
+                                    self.remote_server = Some(srv);
+                                    self.remote_error = None;
+                                    self.remote_state_dirty = true;
+                                }
+                                Err(e) => self.remote_error = Some(e),
                             }
-                            Err(e) => self.remote_error = Some(e),
                         }
                     }
-                }
-                if let Some(srv) = self.remote_server.as_ref() {
-                    let url = srv.url();
-                    if ui
-                        .small_button(egui::RichText::new(&url).monospace().color(Color32::from_rgb(56, 189, 248)))
-                        .on_hover_text("Ouvrir cette adresse dans Safari sur iPad (cliquer pour copier)")
-                        .clicked()
-                    {
-                        ctx.copy_text(url.clone());
-                        self.status_info = Some(format!("Adresse iPad copiée : {url}"));
+                    if let Some(srv) = self.remote_server.as_ref() {
+                        let url = srv.url();
+                        ui.separator();
+                        ui.label(format!("Clients connectés : {}", srv.client_count()));
+                        if ui
+                            .button(egui::RichText::new(&url).monospace().color(Color32::from_rgb(56, 189, 248)))
+                            .on_hover_text("Cliquer pour copier l'adresse Safari iPad")
+                            .clicked()
+                        {
+                            ctx.copy_text(url.clone());
+                            self.status_info = Some(format!("Adresse iPad copiée : {url}"));
+                            ui.close_menu();
+                        }
+                        if let Some(osc_p) = srv.osc_port {
+                            ui.weak(format!("Port OSC UDP : {osc_p}"));
+                        }
                     }
-                    if let Some(osc_p) = srv.osc_port {
+                });
+
+                // Accès rapide à droite : infos moteur + switch banque + alertes
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(err) = &self.status_error {
+                        ui.colored_label(Color32::from_rgb(239, 68, 68), err);
+                    } else if let Some(rerr) = &self.remote_error {
+                        ui.colored_label(Color32::from_rgb(245, 158, 11), rerr);
+                    } else if let Some(merr) = self.midi_manager.last_error() {
+                        ui.colored_label(Color32::from_rgb(245, 158, 11), merr);
+                    } else if let Some(info) = &self.status_info {
+                        ui.colored_label(Color32::from_rgb(16, 185, 129), info);
+                    }
+
+                    if let Some(eng) = &self.engine {
+                        let ms = (eng.buffer_frames as f32 / eng.sample_rate.max(1) as f32) * 1000.0;
                         ui.label(
-                            egui::RichText::new(format!("OSC:{osc_p}"))
-                                .monospace()
-                                .size(10.5)
-                                .color(Color32::GRAY),
+                            egui::RichText::new(format!(
+                                "{} Hz · {} smp ({:.1} ms) · {}IN/{}OUT",
+                                eng.sample_rate, eng.buffer_frames, ms, eng.in_channels, eng.out_channels
+                            ))
+                            .size(11.0)
+                            .color(Color32::GRAY),
                         );
                     }
-                }
 
-                if let Some(eng) = &self.engine {
-                    let ms = (eng.buffer_frames as f32 / eng.sample_rate.max(1) as f32) * 1000.0;
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} Hz · {} smp ({:.1} ms) · {}IN/{}OUT",
-                            eng.sample_rate, eng.buffer_frames, ms, eng.in_channels, eng.out_channels
-                        ))
-                        .size(11.0)
-                        .color(Color32::GRAY),
-                    );
-                }
-                if let Some(err) = &self.status_error {
-                    ui.colored_label(Color32::from_rgb(239, 68, 68), err);
-                } else if let Some(rerr) = &self.remote_error {
-                    ui.colored_label(Color32::from_rgb(245, 158, 11), rerr);
-                } else if let Some(info) = &self.status_info {
-                    ui.colored_label(Color32::from_rgb(16, 185, 129), info);
-                }
-                if let Some(merr) = self.midi_manager.last_error() {
-                    ui.colored_label(Color32::from_rgb(245, 158, 11), merr);
-                }
+                    if ui
+                        .small_button(self.input_bank.label())
+                        .on_hover_text("Basculer la banque d'entrées (1–8 / 9–16 / Tout)")
+                        .clicked()
+                    {
+                        self.input_bank = self.input_bank.next();
+                    }
+
+                    let any_solo = self.strips.iter().any(|s| s.kind != StripKind::Master && s.solo);
+                    if any_solo && ui.small_button("Solo Clear").clicked() {
+                        for i in 0..self.strips.len() {
+                            if self.strips[i].solo {
+                                self.strips[i].solo = false;
+                                self.send(MixerCommand::SetSolo { strip: i, solo: false });
+                            }
+                        }
+                    }
+                });
             });
         });
 
-        // Barre Lecteur Audio MP3 / WAV (Play / Pause / Stop / Progression / Destination)
-        egui::TopBottomPanel::top("player_bar").show(ctx, |ui| {
+        // Barre Lecteur Audio MP3 / WAV (affichable/masquable depuis Affichage)
+        if self.show_player_bar {
+            egui::TopBottomPanel::top("player_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("Lecteur MP3/WAV").strong().color(Color32::from_rgb(56, 189, 248)));
                 if ui.button("Ouvrir fichier...").clicked() {
@@ -1329,7 +1413,8 @@ impl eframe::App for UmcMixerApp {
                         }
                     });
             });
-        });
+            });
+        }
 
         let visible_indices = self.visible_strip_indices();
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1552,7 +1637,7 @@ impl UmcMixerApp {
                         let aux_i = idx - NUM_INPUT_STRIPS;
                         let pair = aux_i / 2;
                         let is_stereo = self.aux_pair_stereo[pair];
-                        let spacer_h = gain_knob_sz + (gain_knob_sz * 0.48).clamp(11.0, 16.0) + 28.0;
+                        let spacer_h = gain_knob_sz + (gain_knob_sz * 0.48).clamp(11.0, 16.0) + 74.0 * scale;
                         ui.allocate_ui(egui::vec2(strip_w, spacer_h), |ui| {
                             ui.vertical_centered(|ui| {
                                 ui.label(
@@ -1579,7 +1664,7 @@ impl UmcMixerApp {
                             });
                         });
                     } else {
-                        let spacer_h = gain_knob_sz + (gain_knob_sz * 0.48).clamp(11.0, 16.0) + 46.0;
+                        let spacer_h = gain_knob_sz + (gain_knob_sz * 0.48).clamp(11.0, 16.0) + 92.0 * scale;
                         ui.allocate_ui(egui::vec2(strip_w, spacer_h), |ui| {
                             ui.centered_and_justified(|ui| {
                                 ui.label(egui::RichText::new("BUS MASTER").size(text_sm).color(Color32::GRAY));
@@ -1589,30 +1674,62 @@ impl UmcMixerApp {
 
                     ui.separator();
 
-                    // Routage MIDI de la tranche (OFF / OMNI / Canal 1..16)
-                    let midi_label = match self.strips[idx].midi_mode {
-                        None => "MIDI: OFF".to_string(),
-                        Some(0) => "MIDI: OMNI".to_string(),
-                        Some(ch) => format!("MIDI: CH {ch}"),
-                    };
-                    egui::ComboBox::from_id_salt(format!("midi_ch_{idx}"))
-                        .selected_text(egui::RichText::new(midi_label).size(text_sm))
-                        .width(strip_w - 4.0)
-                        .show_ui(ui, |ui| {
-                            let mut mode = self.strips[idx].midi_mode;
-                            let mut changed = false;
-                            changed |= ui.selectable_value(&mut mode, None, "OFF").changed();
-                            changed |= ui.selectable_value(&mut mode, Some(0), "OMNI (1-16)").changed();
-                            for ch in 1..=16_u8 {
+                    // Routage MIDI (Appareil + Canal) — PISTES D'ENTRÉE UNIQUEMENT (retiré des Aux et du Master)
+                    if kind == StripKind::Input {
+                        let midi_dev_label = match &self.strips[idx].midi_device {
+                            StripMidiDevice::All => "MIDI: Tous".to_string(),
+                            StripMidiDevice::None => "MIDI: Aucun".to_string(),
+                            StripMidiDevice::Port(p) => format!("MIDI: {p}"),
+                        };
+                        let midi_ports = self.midi_manager.ports().to_vec();
+                        egui::ComboBox::from_id_salt(format!("midi_dev_{idx}"))
+                            .selected_text(egui::RichText::new(&midi_dev_label).size(text_sm))
+                            .width(strip_w - 4.0)
+                            .show_ui(ui, |ui| {
+                                let mut dev = self.strips[idx].midi_device.clone();
+                                let mut changed = false;
                                 changed |= ui
-                                    .selectable_value(&mut mode, Some(ch), format!("Canal {ch}"))
+                                    .selectable_value(&mut dev, StripMidiDevice::All, "Tous les appareils")
                                     .changed();
-                            }
-                            if changed {
-                                self.strips[idx].midi_mode = mode;
-                                self.send(MixerCommand::SetStripMidiMode { strip: idx, mode });
-                            }
-                        });
+                                changed |= ui
+                                    .selectable_value(&mut dev, StripMidiDevice::None, "Aucun (MIDI Off)")
+                                    .changed();
+                                for port in midi_ports {
+                                    changed |= ui
+                                        .selectable_value(&mut dev, StripMidiDevice::Port(port.clone()), port)
+                                        .changed();
+                                }
+                                if changed {
+                                    let filter = self.midi_manager.resolve_filter(&dev);
+                                    self.strips[idx].midi_device = dev;
+                                    self.send(MixerCommand::SetStripMidiDevice { strip: idx, filter });
+                                }
+                            });
+
+                        let midi_label = match self.strips[idx].midi_mode {
+                            None => "Canal: OFF".to_string(),
+                            Some(0) => "Canal: OMNI".to_string(),
+                            Some(ch) => format!("Canal: CH {ch}"),
+                        };
+                        egui::ComboBox::from_id_salt(format!("midi_ch_{idx}"))
+                            .selected_text(egui::RichText::new(midi_label).size(text_sm))
+                            .width(strip_w - 4.0)
+                            .show_ui(ui, |ui| {
+                                let mut mode = self.strips[idx].midi_mode;
+                                let mut changed = false;
+                                changed |= ui.selectable_value(&mut mode, None, "OFF").changed();
+                                changed |= ui.selectable_value(&mut mode, Some(0), "OMNI (1-16)").changed();
+                                for ch in 1..=16_u8 {
+                                    changed |= ui
+                                        .selectable_value(&mut mode, Some(ch), format!("Canal {ch}"))
+                                        .changed();
+                                }
+                                if changed {
+                                    self.strips[idx].midi_mode = mode;
+                                    self.send(MixerCommand::SetStripMidiMode { strip: idx, mode });
+                                }
+                            });
+                    }
 
                     // 2. 5 emplacements d'inserts VST2/VST3/AU maximum
                     ui.label(egui::RichText::new("INSERTS (5 MAX)").size(text_sm * 0.92).color(Color32::GRAY));

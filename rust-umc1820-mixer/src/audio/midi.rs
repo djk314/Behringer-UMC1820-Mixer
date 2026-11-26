@@ -1,14 +1,7 @@
-use super::state::MidiMessage;
+use super::state::{MidiMessage, MidiPortFilter, StripMidiDevice};
 use midir::{Ignore, MidiInput, MidiInputConnection};
 use ringbuf::traits::Producer;
 use std::sync::{Arc, Mutex};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MidiPortSelection {
-    All,
-    None,
-    Port(String),
-}
 
 pub fn list_midi_inputs() -> Vec<String> {
     let Ok(midi_in) = MidiInput::new("umc1820-midi-scan") else {
@@ -25,7 +18,7 @@ pub struct MidiInputManager {
     sender: Arc<Mutex<Option<ringbuf::HeapProd<MidiMessage>>>>,
     connections: Vec<MidiInputConnection<()>>,
     ports: Vec<String>,
-    selection: MidiPortSelection,
+    enabled: bool,
     last_error: Option<String>,
 }
 
@@ -35,7 +28,7 @@ impl MidiInputManager {
             sender: Arc::new(Mutex::new(None)),
             connections: Vec::new(),
             ports: Vec::new(),
-            selection: MidiPortSelection::All,
+            enabled: true,
             last_error: None,
         };
         mgr.refresh_ports();
@@ -52,8 +45,15 @@ impl MidiInputManager {
         &self.ports
     }
 
-    pub fn selection(&self) -> &MidiPortSelection {
-        &self.selection
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if self.enabled != enabled {
+            self.enabled = enabled;
+            self.reconnect();
+        }
     }
 
     pub fn connected_count(&self) -> usize {
@@ -64,18 +64,25 @@ impl MidiInputManager {
         self.last_error.as_deref()
     }
 
-    pub fn select(&mut self, selection: MidiPortSelection) {
-        self.selection = selection;
-        self.reconnect();
+    pub fn resolve_filter(&self, device: &StripMidiDevice) -> MidiPortFilter {
+        if !self.enabled {
+            return MidiPortFilter::None;
+        }
+        match device {
+            StripMidiDevice::All => MidiPortFilter::All,
+            StripMidiDevice::None => MidiPortFilter::None,
+            StripMidiDevice::Port(name) => self
+                .ports
+                .iter()
+                .position(|p| p == name)
+                .and_then(|idx| u8::try_from(idx).ok())
+                .map(MidiPortFilter::PortIndex)
+                .unwrap_or(MidiPortFilter::None),
+        }
     }
 
     pub fn refresh_ports(&mut self) {
         self.ports = list_midi_inputs();
-        if let MidiPortSelection::Port(ref target) = self.selection {
-            if !self.ports.iter().any(|p| p == target) {
-                self.selection = MidiPortSelection::All;
-            }
-        }
         self.reconnect();
     }
 
@@ -83,17 +90,14 @@ impl MidiInputManager {
         self.connections.clear();
         self.last_error = None;
 
-        if self.selection == MidiPortSelection::None {
+        if !self.enabled {
             return;
         }
 
-        let target_names: Vec<String> = match &self.selection {
-            MidiPortSelection::All => self.ports.clone(),
-            MidiPortSelection::Port(name) => vec![name.clone()],
-            MidiPortSelection::None => Vec::new(),
-        };
-
-        for port_name in target_names {
+        for (idx, port_name) in self.ports.iter().enumerate() {
+            let Ok(port_id) = u8::try_from(idx) else {
+                break;
+            };
             let mut midi_in = match MidiInput::new("umc1820-studio-mixer") {
                 Ok(m) => m,
                 Err(e) => {
@@ -113,7 +117,7 @@ impl MidiInputManager {
             };
 
             let sender = Arc::clone(&self.sender);
-            let conn_label = format!("umc1820-in-{port_name}");
+            let conn_label = format!("umc1820-in-{idx}");
             match midi_in.connect(
                 &port,
                 &conn_label,
@@ -121,6 +125,7 @@ impl MidiInputManager {
                     if !bytes.is_empty() && bytes[0] >= 0x80 && bytes[0] < 0xF0 {
                         let len = bytes.len().min(3);
                         let mut msg = MidiMessage {
+                            port_id,
                             bytes: [0; 3],
                             len: len as u8,
                         };

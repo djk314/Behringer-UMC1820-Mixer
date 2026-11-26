@@ -82,6 +82,11 @@ export type InputPairStereoState = [
 ];
 export type AudioBufferLatencyPreset = 64 | 128 | 256 | 512 | 1024 | 2048;
 
+export interface MidiPortInfo {
+  id: string;
+  name: string;
+}
+
 export interface StripState {
   id: string;
   index: number;
@@ -92,6 +97,10 @@ export interface StripState {
   outputRoute: HardwareOutputRoute;
   /** Rotary Gain (-12 dB .. +24 dB). Not rendered/active on Master strip. */
   gainDb: number;
+  /** MIDI Input device routing ('all' | 'none' | portName) — Input strips only. */
+  midiDevice: string;
+  /** MIDI Channel routing (null = Off, 0 = Omni, 1..16 = Channel) — Input strips only. */
+  midiChannel: number | null;
   /** Maximum 5 insert plugins per strip (VST2 / VST3 / Apple AU). */
   inserts: InsertPluginSlot[];
   /** 5-band rotary EQ (with center Mid band). */

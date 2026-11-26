@@ -43,6 +43,27 @@ impl Default for OutputTargetRoute {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StripMidiDevice {
+    All,
+    None,
+    Port(String),
+}
+
+impl Default for StripMidiDevice {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MidiPortFilter {
+    #[default]
+    All,
+    None,
+    PortIndex(u8),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PluginFormat {
     AudioUnit, // macOS uniquement (.component)
@@ -145,9 +166,12 @@ pub struct StripState {
     pub mute: bool,
     /// Fader de volume en dB (-60 dB = -inf, jusqu'à +12 dB).
     pub volume_db: f32,
-    /// Routage MIDI de la tranche : None = Off, Some(0) = Omni (1..16), Some(1..=16) = canal fixe.
+    /// Routage MIDI de la tranche : None = Off, Some(0) = Omni (1..16), Some(1..=16) = canal fixe (Entrées uniquement).
     #[serde(default)]
     pub midi_mode: Option<u8>,
+    /// Appareil / port MIDI assigné à la tranche (Entrées uniquement).
+    #[serde(default)]
+    pub midi_device: StripMidiDevice,
 }
 
 impl StripState {
@@ -187,6 +211,11 @@ impl StripState {
             mute: false,
             volume_db: 0.0,
             midi_mode: if kind == StripKind::Input { Some(0) } else { None },
+            midi_device: if kind == StripKind::Input {
+                StripMidiDevice::All
+            } else {
+                StripMidiDevice::None
+            },
         }
     }
 
@@ -196,6 +225,10 @@ impl StripState {
             self.aux_sends.resize(NUM_AUX_STRIPS, 0.0);
         } else if self.aux_sends.len() > NUM_AUX_STRIPS {
             self.aux_sends.truncate(NUM_AUX_STRIPS);
+        }
+        if self.kind != StripKind::Input {
+            self.midi_mode = None;
+            self.midi_device = StripMidiDevice::None;
         }
     }
 }
@@ -236,6 +269,7 @@ fn default_aux_pairs() -> [bool; MAX_AUX_PAIRS] {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MidiMessage {
+    pub port_id: u8,
     pub bytes: [u8; 3],
     pub len: u8,
 }
@@ -279,6 +313,7 @@ pub enum MixerCommand {
     SetInputRoute { strip: usize, route: InputSourceRoute },
     SetOutputRoute { strip: usize, route: OutputTargetRoute },
     SetStripMidiMode { strip: usize, mode: Option<u8> },
+    SetStripMidiDevice { strip: usize, filter: MidiPortFilter },
     InstallInsert {
         strip: usize,
         slot: usize,

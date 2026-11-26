@@ -10,6 +10,7 @@ import {
   MAX_AUX_PAIRS,
   MAX_INSERTS_PER_STRIP,
   MeterLevel,
+  MidiPortInfo,
   NUM_INPUT_STRIPS,
   StripState,
   formatInputRouteLabel,
@@ -26,6 +27,7 @@ interface ChannelStripProps {
   inputPairStereo: InputPairStereoState;
   auxPairStereo: AuxPairStereoState;
   hardwareChannels?: { in: number; out: number };
+  midiPorts?: MidiPortInfo[];
   onToggleInputPair?: (pairIndex: number) => void;
   onToggleAuxPair?: (pairIndex: number) => void;
   onUpdate: (stripId: string, updater: (prev: StripState) => StripState) => void;
@@ -76,6 +78,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
   inputPairStereo,
   auxPairStereo,
   hardwareChannels = { in: 8, out: 10 },
+  midiPorts = [],
   onToggleInputPair,
   onToggleAuxPair,
   onUpdate,
@@ -322,9 +325,60 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 <span>{isInputStereo ? 'Stéréo → Mono' : 'Mono → Stéréo'}</span>
               </button>
             )}
+
+            {/* Routage MIDI (Appareil + Canal) — PISTES D'ENTRÉE UNIQUEMENT */}
+            <div className="w-full flex flex-col gap-1 pt-1 border-t border-[#232936]/70">
+              <select
+                aria-label={`Appareil MIDI ${strip.name}`}
+                value={strip.midiDevice}
+                onChange={(e) =>
+                  onUpdate(strip.id, (s) => ({ ...s, midiDevice: e.target.value }))
+                }
+                className="w-full bg-[#0B0E14] border border-emerald-500/30 rounded px-1.5 py-0.5 text-[10px] text-emerald-200 focus:outline-none focus:border-emerald-400 truncate"
+                title="Appareil MIDI source pour cette tranche d'entrée"
+              >
+                <option value="all">MIDI : Tous</option>
+                <option value="none">MIDI : Aucun</option>
+                {midiPorts.map((port) => (
+                  <option key={port.id} value={port.name}>
+                    MIDI : {port.name}
+                  </option>
+                ))}
+                {strip.midiDevice !== 'all' &&
+                  strip.midiDevice !== 'none' &&
+                  !midiPorts.some((p) => p.name === strip.midiDevice) && (
+                    <option value={strip.midiDevice}>MIDI : {strip.midiDevice}</option>
+                  )}
+              </select>
+
+              <select
+                aria-label={`Canal MIDI ${strip.name}`}
+                value={strip.midiChannel === null ? 'off' : String(strip.midiChannel)}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  onUpdate(strip.id, (s) => ({
+                    ...s,
+                    midiChannel: val === 'off' ? null : Number(val),
+                  }));
+                }}
+                className="w-full bg-[#0B0E14] border border-[#232936] rounded px-1.5 py-0.5 text-[10px] text-slate-300 focus:outline-none focus:border-emerald-400 truncate"
+                title="Canal MIDI reçu par cette tranche d'entrée"
+              >
+                <option value="off">Canal MIDI : OFF</option>
+                <option value="0">Canal MIDI : OMNI (1-16)</option>
+                {Array.from({ length: 16 }, (_, chIdx) => {
+                  const ch = chIdx + 1;
+                  return (
+                    <option key={`mch-${ch}`} value={String(ch)}>
+                      Canal MIDI : CH {ch}
+                    </option>
+                  );
+                })}
+              </select>
+            </div>
           </>
         ) : (
-          <div className="h-[52px] flex flex-col items-center justify-center text-center px-1">
+          <div className="h-[104px] flex flex-col items-center justify-center text-center px-1">
             <span className="text-[10px] font-medium text-slate-400">
               {isMaster
                 ? 'Bus Master'
