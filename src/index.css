@@ -2,21 +2,220 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 @layer base {
-  :root {
+  :root,
+  [data-theme="nuit_console"] {
     --font-sans: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
     --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+    --bg-app: #0b0e14;
+    --bg-header: #0e121a;
+    --bg-menubar: #11151e;
+    --bg-player: #0d1119;
+    --bg-viewport: #0c1018;
+    --bg-panel: #141923;
+    --bg-control: #171c26;
+    --bg-control-alt: #1a202c;
+    --bg-hover: #1e2636;
+    --bg-strip-in: #131720;
+    --bg-strip-aux: #121924;
+    --bg-strip-master: #19161d;
+    --border-main: #232936;
+    --border-strong: #2d3545;
+    --text-main: #e2e8f0;
+    --text-muted: #94a3b8;
+    --knob-track: #232936;
+    --knob-body: #171c26;
+    --knob-stroke: #334155;
+    --knob-pointer: #f8fafc;
+    --fader-slot: #07090d;
+  }
+
+  [data-theme="noir_studio"] {
+    --bg-app: #05070b;
+    --bg-header: #07090f;
+    --bg-menubar: #090c13;
+    --bg-player: #080a10;
+    --bg-viewport: #07090e;
+    --bg-panel: #0d1017;
+    --bg-control: #0f131b;
+    --bg-control-alt: #121722;
+    --bg-hover: #171d2b;
+    --bg-strip-in: #0b0d13;
+    --bg-strip-aux: #0a1018;
+    --bg-strip-master: #120e11;
+    --border-main: #1a1f2a;
+    --border-strong: #242b3a;
+    --text-main: #f1f5f9;
+    --text-muted: #94a3b8;
+    --knob-track: #1a1f2a;
+    --knob-body: #0f131b;
+    --knob-stroke: #2a3345;
+    --knob-pointer: #f8fafc;
+    --fader-slot: #040508;
+  }
+
+  [data-theme="ardoise"] {
+    --bg-app: #1e2430;
+    --bg-header: #232a38;
+    --bg-menubar: #262e3e;
+    --bg-player: #212836;
+    --bg-viewport: #1b212d;
+    --bg-panel: #283040;
+    --bg-control: #2c3547;
+    --bg-control-alt: #323c50;
+    --bg-hover: #3b465e;
+    --bg-strip-in: #262e3c;
+    --bg-strip-aux: #213042;
+    --bg-strip-master: #342a30;
+    --border-main: #404c60;
+    --border-strong: #4f5d75;
+    --text-main: #f1f5f9;
+    --text-muted: #cbd5e1;
+    --knob-track: #3e4a60;
+    --knob-body: #2d3648;
+    --knob-stroke: #64748b;
+    --knob-pointer: #f8fafc;
+    --fader-slot: #161b24;
+  }
+
+  [data-theme="titane"] {
+    --bg-app: #d6dce6;
+    --bg-header: #dee4ed;
+    --bg-menubar: #e2e7f0;
+    --bg-player: #dce2ec;
+    --bg-viewport: #cdd4e0;
+    --bg-panel: #eef2f7;
+    --bg-control: #f4f7fb;
+    --bg-control-alt: #e4e9f2;
+    --bg-hover: #d5dde9;
+    --bg-strip-in: #e4e9f2;
+    --bg-strip-aux: #d6e2f0;
+    --bg-strip-master: #ece0e2;
+    --border-main: #a8b2c2;
+    --border-strong: #8c98ab;
+    --text-main: #0f172a;
+    --text-muted: #475569;
+    --knob-track: #b4bece;
+    --knob-body: #f8fafc;
+    --knob-stroke: #64748b;
+    --knob-pointer: #0f172a;
+    --fader-slot: #b9c3d4;
+  }
+
+  [data-theme="lumiere_jour"] {
+    --bg-app: #f4f6fa;
+    --bg-header: #ffffff;
+    --bg-menubar: #f8fafc;
+    --bg-player: #f1f5f9;
+    --bg-viewport: #eaeff6;
+    --bg-panel: #ffffff;
+    --bg-control: #f8fafc;
+    --bg-control-alt: #eef2f7;
+    --bg-hover: #e2e8f0;
+    --bg-strip-in: #ffffff;
+    --bg-strip-aux: #edf5fd;
+    --bg-strip-master: #fdf2ee;
+    --border-main: #cbd5e1;
+    --border-strong: #94a3b8;
+    --text-main: #0f172a;
+    --text-muted: #475569;
+    --knob-track: #cbd5e1;
+    --knob-body: #f1f5f9;
+    --knob-stroke: #64748b;
+    --knob-pointer: #0f172a;
+    --fader-slot: #cbd5e1;
   }
 
   body {
     font-family: var(--font-sans);
-    background-color: #0b0e14;
-    color: #e2e8f0;
+    background-color: var(--bg-app);
+    color: var(--text-main);
+    transition: background-color 150ms ease, color 150ms ease;
   }
 
   code, pre, .font-mono {
     font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }
+}
+
+/* Light theme readability overrides for secondary views & controls */
+[data-theme="titane"] .text-slate-100,
+[data-theme="lumiere_jour"] .text-slate-100,
+[data-theme="titane"] .text-slate-200,
+[data-theme="lumiere_jour"] .text-slate-200,
+[data-theme="titane"] .text-slate-300,
+[data-theme="lumiere_jour"] .text-slate-300 {
+  color: #0f172a;
+}
+
+[data-theme="titane"] .text-slate-400,
+[data-theme="lumiere_jour"] .text-slate-400,
+[data-theme="titane"] .text-slate-500,
+[data-theme="lumiere_jour"] .text-slate-500 {
+  color: #475569;
+}
+
+[data-theme="titane"] .text-amber-200,
+[data-theme="titane"] .text-amber-300,
+[data-theme="lumiere_jour"] .text-amber-200,
+[data-theme="lumiere_jour"] .text-amber-300 {
+  color: #b45309;
+}
+
+[data-theme="titane"] .text-sky-200,
+[data-theme="titane"] .text-sky-300,
+[data-theme="lumiere_jour"] .text-sky-200,
+[data-theme="lumiere_jour"] .text-sky-300 {
+  color: #0369a1;
+}
+
+[data-theme="titane"] .text-emerald-200,
+[data-theme="titane"] .text-emerald-300,
+[data-theme="lumiere_jour"] .text-emerald-200,
+[data-theme="lumiere_jour"] .text-emerald-300 {
+  color: #047857;
+}
+
+[data-theme="titane"] .bg-\[\#131720\],
+[data-theme="lumiere_jour"] .bg-\[\#131720\],
+[data-theme="titane"] .bg-\[\#141923\],
+[data-theme="lumiere_jour"] .bg-\[\#141923\],
+[data-theme="titane"] .bg-\[\#0F131B\],
+[data-theme="lumiere_jour"] .bg-\[\#0F131B\],
+[data-theme="titane"] .bg-\[\#0F131B\]\/50,
+[data-theme="lumiere_jour"] .bg-\[\#0F131B\]\/50 {
+  background-color: var(--bg-panel);
+}
+
+[data-theme="titane"] .bg-\[\#0B0E14\],
+[data-theme="lumiere_jour"] .bg-\[\#0B0E14\],
+[data-theme="titane"] .bg-\[\#0B0E14\]\/60,
+[data-theme="lumiere_jour"] .bg-\[\#0B0E14\]\/60,
+[data-theme="titane"] .bg-\[\#0B0E14\]\/70,
+[data-theme="lumiere_jour"] .bg-\[\#0B0E14\]\/70,
+[data-theme="titane"] .bg-\[\#0E121B\],
+[data-theme="lumiere_jour"] .bg-\[\#0E121B\],
+[data-theme="titane"] .bg-\[\#171C26\],
+[data-theme="lumiere_jour"] .bg-\[\#171C26\],
+[data-theme="titane"] .bg-\[\#1A202C\],
+[data-theme="lumiere_jour"] .bg-\[\#1A202C\] {
+  background-color: var(--bg-control);
+}
+
+[data-theme="titane"] .hover\:bg-\[\#1E2636\]:hover,
+[data-theme="lumiere_jour"] .hover\:bg-\[\#1E2636\]:hover,
+[data-theme="titane"] .hover\:bg-\[\#171C28\]:hover,
+[data-theme="lumiere_jour"] .hover\:bg-\[\#171C28\]:hover {
+  background-color: var(--bg-hover);
+}
+
+[data-theme="titane"] .border-\[\#232936\],
+[data-theme="lumiere_jour"] .border-\[\#232936\],
+[data-theme="titane"] .border-\[\#283040\],
+[data-theme="lumiere_jour"] .border-\[\#283040\],
+[data-theme="titane"] .border-\[\#2D3545\],
+[data-theme="lumiere_jour"] .border-\[\#2D3545\] {
+  border-color: var(--border-main);
 }
 
 /* Custom subtle studio console scrollbar */
@@ -26,14 +225,14 @@
 }
 
 ::-webkit-scrollbar-track {
-  background: #0b0e14;
+  background: var(--bg-app);
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #232936;
+  background: var(--border-strong);
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #334155;
+  background: #64748b;
 }

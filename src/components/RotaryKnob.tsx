@@ -139,7 +139,7 @@ export const RotaryKnob: React.FC<RotaryKnobProps> = ({
           <path
             d={describeArc(startAngle, startAngle + sweepAngle, r)}
             fill="none"
-            stroke="#232936"
+            stroke="var(--knob-track)"
             strokeWidth={2.5}
             strokeLinecap="round"
           />
@@ -156,8 +156,8 @@ export const RotaryKnob: React.FC<RotaryKnobProps> = ({
             cx={cx}
             cy={cy}
             r={r - 3.5}
-            fill="#171C26"
-            stroke={isDragging ? accentColor : '#334155'}
+            fill="var(--knob-body)"
+            stroke={isDragging ? accentColor : 'var(--knob-stroke)'}
             strokeWidth={1.25}
           />
           {/* Pointer line */}
@@ -166,17 +166,17 @@ export const RotaryKnob: React.FC<RotaryKnobProps> = ({
             y1={pointerBase.y}
             x2={pointerTip.x}
             y2={pointerTip.y}
-            stroke="#F8FAFC"
+            stroke="var(--knob-pointer)"
             strokeWidth={1.8}
             strokeLinecap="round"
           />
         </svg>
       </div>
       <div className="flex flex-col items-center leading-tight">
-        <span className="text-[10px] font-medium text-slate-400 tracking-tight whitespace-nowrap">
+        <span className="text-[10px] font-medium text-[var(--text-muted)] tracking-tight whitespace-nowrap">
           {label}
         </span>
-        <span className="text-[10px] font-mono tabular-nums text-slate-300">
+        <span className="text-[10px] font-mono tabular-nums text-[var(--text-main)]">
           {formattedValue}
         </span>
       </div>

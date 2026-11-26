@@ -263,9 +263,51 @@ fn scan_dir_recursive(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn with_macos_plugin_guard<T>(f: impl FnOnce() -> T) -> T {
+    extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
+        fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
+        fn objc_msgSend();
+        fn objc_autoreleasePoolPush() -> *mut c_void;
+        fn objc_autoreleasePoolPop(pool: *mut c_void);
+    }
+    unsafe {
+        let pool = objc_autoreleasePoolPush();
+        let msg0: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let msg0_void: unsafe extern "C" fn(*mut c_void, *mut c_void) =
+            std::mem::transmute(objc_msgSend as *const ());
+        let gl_cls = objc_getClass(c"NSOpenGLContext".as_ptr());
+        let sel_cur = sel_registerName(c"currentContext".as_ptr());
+        let sel_make = sel_registerName(c"makeCurrentContext".as_ptr());
+        let sel_clear = sel_registerName(c"clearCurrentContext".as_ptr());
+        let prev_gl = if !gl_cls.is_null() {
+            msg0(gl_cls, sel_cur)
+        } else {
+            std::ptr::null_mut()
+        };
+
+        let out = f();
+
+        if !gl_cls.is_null() {
+            let cur_gl = msg0(gl_cls, sel_cur);
+            if cur_gl != prev_gl {
+                if prev_gl.is_null() {
+                    msg0_void(gl_cls, sel_clear);
+                } else {
+                    msg0_void(prev_gl, sel_make);
+                }
+            }
+        }
+        objc_autoreleasePoolPop(pool);
+        out
+    }
+}
+
 /// Charge dynamiquement un plugin VST3 (.vst3), VST2 (.vst/.so) ou AudioUnit (.component).
 pub fn instantiate_plugin(desc: &DiscoveredPlugin) -> Result<Box<dyn HostedPlugin>, String> {
-    match desc.format {
+    let load_fn = || match desc.format {
         PluginFormat::Vst3 => Vst3PluginInstance::load(&desc.name, &desc.path)
             .map(|p| Box::new(p) as Box<dyn HostedPlugin>),
         PluginFormat::Vst2 => Vst2PluginInstance::load(&desc.name, &desc.path)
@@ -280,6 +322,14 @@ pub fn instantiate_plugin(desc: &DiscoveredPlugin) -> Result<Box<dyn HostedPlugi
                 Err("Apple AudioUnit est uniquement disponible sur macOS CoreAudio.".into())
             }
         }
+    };
+    #[cfg(target_os = "macos")]
+    {
+        with_macos_plugin_guard(load_fn)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        load_fn()
     }
 }
 

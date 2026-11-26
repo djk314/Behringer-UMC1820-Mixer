@@ -244,6 +244,8 @@ pub struct MixerSetFile {
     pub input_pair_stereo: [bool; MAX_INPUT_PAIRS],
     #[serde(default = "default_aux_pairs")]
     pub aux_pair_stereo: [bool; MAX_AUX_PAIRS],
+    #[serde(default = "default_input_order")]
+    pub input_order: Vec<usize>,
     pub strips: Vec<StripState>,
     #[serde(default)]
     pub selected_device: Option<String>,
@@ -265,6 +267,25 @@ fn default_input_pairs() -> [bool; MAX_INPUT_PAIRS] {
 
 fn default_aux_pairs() -> [bool; MAX_AUX_PAIRS] {
     [true; MAX_AUX_PAIRS]
+}
+
+pub fn default_input_order() -> Vec<usize> {
+    (0..NUM_INPUT_STRIPS).collect()
+}
+
+pub fn normalize_input_order(raw: &[usize]) -> Vec<usize> {
+    let mut out = Vec::with_capacity(NUM_INPUT_STRIPS);
+    for &idx in raw {
+        if idx < NUM_INPUT_STRIPS && !out.contains(&idx) {
+            out.push(idx);
+        }
+    }
+    for idx in 0..NUM_INPUT_STRIPS {
+        if !out.contains(&idx) {
+            out.push(idx);
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, Default)]

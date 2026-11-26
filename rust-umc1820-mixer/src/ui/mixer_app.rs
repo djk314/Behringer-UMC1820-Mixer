@@ -5,10 +5,10 @@ use crate::audio::midi::MidiInputManager;
 use crate::audio::player::decode_audio_file;
 use crate::audio::plugin_host::{instantiate_plugin, scan_system_plugins, HostedPlugin};
 use crate::audio::state::{
-    DiscoveredPlugin, InputSourceRoute, MeterFrame, MixerCommand, MixerSetFile, NativePluginHandle,
-    OutputTargetRoute, PlayerProgress, PluginFormat, StripKind, StripMidiDevice, StripState,
-    MAX_AUX_PAIRS, MAX_INPUT_PAIRS, MAX_INSERTS_PER_STRIP, NUM_AUX_STRIPS, NUM_INPUT_STRIPS,
-    TOTAL_STRIPS,
+    default_input_order, normalize_input_order, DiscoveredPlugin, InputSourceRoute, MeterFrame,
+    MixerCommand, MixerSetFile, NativePluginHandle, OutputTargetRoute, PlayerProgress,
+    PluginFormat, StripKind, StripMidiDevice, StripState, MAX_AUX_PAIRS, MAX_INPUT_PAIRS,
+    MAX_INSERTS_PER_STRIP, NUM_AUX_STRIPS, NUM_INPUT_STRIPS, TOTAL_STRIPS,
 };
 use crate::remote::{
     RemoteCommand, RemoteMeterEntry, RemoteMetersPacket, RemotePlayerProgressView, RemoteServer,
@@ -88,6 +88,121 @@ impl InputBankFilter {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiTheme {
+    NoirStudio,
+    NuitConsole,
+    Ardoise,
+    Titane,
+    LumiereJour,
+}
+
+impl UiTheme {
+    const ALL: [Self; 5] = [
+        Self::NoirStudio,
+        Self::NuitConsole,
+        Self::Ardoise,
+        Self::Titane,
+        Self::LumiereJour,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NoirStudio => "1. Noir Studio (Très sombre)",
+            Self::NuitConsole => "2. Nuit Console (Sombre)",
+            Self::Ardoise => "3. Ardoise (Moyen)",
+            Self::Titane => "4. Titane (Clair)",
+            Self::LumiereJour => "5. Lumière Jour (Très clair)",
+        }
+    }
+
+    fn is_light(self) -> bool {
+        matches!(self, Self::Titane | Self::LumiereJour)
+    }
+
+    fn panel_fill(self) -> Color32 {
+        match self {
+            Self::NoirStudio => Color32::from_rgb(5, 7, 11),
+            Self::NuitConsole => Color32::from_rgb(11, 14, 20),
+            Self::Ardoise => Color32::from_rgb(30, 36, 48),
+            Self::Titane => Color32::from_rgb(214, 220, 230),
+            Self::LumiereJour => Color32::from_rgb(244, 246, 250),
+        }
+    }
+
+    fn window_fill(self) -> Color32 {
+        match self {
+            Self::NoirStudio => Color32::from_rgb(12, 15, 22),
+            Self::NuitConsole => Color32::from_rgb(19, 23, 32),
+            Self::Ardoise => Color32::from_rgb(40, 48, 62),
+            Self::Titane => Color32::from_rgb(228, 233, 240),
+            Self::LumiereJour => Color32::from_rgb(252, 253, 255),
+        }
+    }
+
+    fn strip_bg(self, kind: StripKind) -> Color32 {
+        match (self, kind) {
+            (Self::NoirStudio, StripKind::Input) => Color32::from_rgb(11, 13, 19),
+            (Self::NoirStudio, StripKind::Aux) => Color32::from_rgb(10, 16, 24),
+            (Self::NoirStudio, StripKind::Master) => Color32::from_rgb(18, 14, 17),
+            (Self::NuitConsole, StripKind::Input) => Color32::from_rgb(19, 23, 32),
+            (Self::NuitConsole, StripKind::Aux) => Color32::from_rgb(17, 25, 36),
+            (Self::NuitConsole, StripKind::Master) => Color32::from_rgb(26, 22, 24),
+            (Self::Ardoise, StripKind::Input) => Color32::from_rgb(38, 46, 60),
+            (Self::Ardoise, StripKind::Aux) => Color32::from_rgb(33, 48, 66),
+            (Self::Ardoise, StripKind::Master) => Color32::from_rgb(52, 42, 48),
+            (Self::Titane, StripKind::Input) => Color32::from_rgb(226, 231, 239),
+            (Self::Titane, StripKind::Aux) => Color32::from_rgb(212, 224, 238),
+            (Self::Titane, StripKind::Master) => Color32::from_rgb(236, 224, 226),
+            (Self::LumiereJour, StripKind::Input) => Color32::from_rgb(255, 255, 255),
+            (Self::LumiereJour, StripKind::Aux) => Color32::from_rgb(236, 244, 253),
+            (Self::LumiereJour, StripKind::Master) => Color32::from_rgb(253, 242, 238),
+        }
+    }
+
+    fn strip_border(self) -> Color32 {
+        match self {
+            Self::NoirStudio => Color32::from_rgb(26, 31, 42),
+            Self::NuitConsole => Color32::from_rgb(35, 41, 54),
+            Self::Ardoise => Color32::from_rgb(64, 76, 96),
+            Self::Titane => Color32::from_rgb(168, 178, 194),
+            Self::LumiereJour => Color32::from_rgb(203, 213, 225),
+        }
+    }
+
+    fn text_primary(self) -> Color32 {
+        if self.is_light() {
+            Color32::from_rgb(15, 23, 42)
+        } else {
+            Color32::from_rgb(236, 242, 250)
+        }
+    }
+
+    fn text_muted(self) -> Color32 {
+        if self.is_light() {
+            Color32::from_rgb(71, 85, 105)
+        } else {
+            Color32::from_rgb(148, 163, 184)
+        }
+    }
+
+    fn apply_to_ctx(self, ctx: &egui::Context) {
+        let mut visuals = if self.is_light() {
+            egui::Visuals::light()
+        } else {
+            egui::Visuals::dark()
+        };
+        visuals.panel_fill = self.panel_fill();
+        visuals.window_fill = self.window_fill();
+        visuals.extreme_bg_color = if self.is_light() {
+            Color32::from_rgb(241, 245, 249)
+        } else {
+            Color32::from_rgb(9, 12, 18)
+        };
+        ctx.set_visuals(visuals);
+    }
+}
+
 const BUFFER_PRESETS: [u32; 6] = [64, 128, 256, 512, 1024, 2048];
 
 fn format_time(secs: f32) -> String {
@@ -116,6 +231,7 @@ pub struct UmcMixerApp {
     strips: Vec<StripState>,
     input_pair_stereo: [bool; MAX_INPUT_PAIRS],
     aux_pair_stereo: [bool; MAX_AUX_PAIRS],
+    input_order: Vec<usize>,
     meters: [MeterFrame; TOTAL_STRIPS],
     // IMPORTANT : déclaré avant `offline_plugins` et `engine` pour fermer toutes les fenêtres natives avant le déchargement des plugins.
     native_editors: NativeEditorManager,
@@ -137,6 +253,8 @@ pub struct UmcMixerApp {
     native_ppp: Option<f32>,
     view_filter: StripViewFilter,
     input_bank: InputBankFilter,
+    theme: UiTheme,
+    applied_theme: Option<UiTheme>,
     show_player_bar: bool,
     status_error: Option<String>,
     status_info: Option<String>,
@@ -194,6 +312,7 @@ impl UmcMixerApp {
             strips,
             input_pair_stereo: [true; MAX_INPUT_PAIRS],
             aux_pair_stereo: [true; MAX_AUX_PAIRS],
+            input_order: default_input_order(),
             meters: [MeterFrame::default(); TOTAL_STRIPS],
             native_editors: NativeEditorManager::new(),
             native_handles: std::array::from_fn(|_| std::array::from_fn(|_| None)),
@@ -214,7 +333,9 @@ impl UmcMixerApp {
             native_ppp: None,
             view_filter: StripViewFilter::All,
             input_bank: InputBankFilter::All,
-            show_player_bar: true,
+            theme: UiTheme::NuitConsole,
+            applied_theme: None,
+            show_player_bar: false,
             status_error,
             status_info: None,
             player_file_path: None,
@@ -485,6 +606,7 @@ impl UmcMixerApp {
                     duration_secs: track.duration_secs(),
                 };
                 self.send(MixerCommand::LoadAudioTrack(Some(Arc::new(track))));
+                self.show_player_bar = true;
                 self.status_error = None;
                 self.status_info = Some(format!("Audio chargé : {}", self.player_title));
             }
@@ -506,9 +628,10 @@ impl UmcMixerApp {
             path.set_extension("umcset");
         }
         let set_data = MixerSetFile {
-            version: 3,
+            version: 4,
             input_pair_stereo: self.input_pair_stereo,
             aux_pair_stereo: self.aux_pair_stereo,
+            input_order: self.input_order.clone(),
             strips: self.strips.clone(),
             selected_device: Some(self.selected_device.clone()),
             buffer_frames: Some(self.requested_buffer_frames),
@@ -601,6 +724,7 @@ impl UmcMixerApp {
         self.strips = next_strips;
         self.input_pair_stereo = next_input_pairs;
         self.aux_pair_stereo = parsed.aux_pair_stereo;
+        self.input_order = normalize_input_order(&parsed.input_order);
         self.player_loop = parsed.player_loop;
         self.player_gain = parsed.player_gain.clamp(0.0, 2.0);
         self.player_target = parsed.player_target.filter(|&i| i < NUM_INPUT_STRIPS);
@@ -725,6 +849,13 @@ impl UmcMixerApp {
     fn apply_window_resize_scale(&mut self, ctx: &egui::Context) -> f32 {
         let cur_ppp = ctx.pixels_per_point().max(0.4);
         let screen = ctx.input(|i| i.screen_rect());
+        if !screen.width().is_finite()
+            || !screen.height().is_finite()
+            || screen.width() < 100.0
+            || screen.height() < 100.0
+        {
+            return 1.0;
+        }
         let phys_w = screen.width() * cur_ppp;
         let phys_h = screen.height() * cur_ppp;
         let base_ppp = *self
@@ -744,26 +875,65 @@ impl UmcMixerApp {
             UiScaleMode::Scale115 => 1.15,
         };
         let target_ppp = (base_ppp * target_zoom).clamp(0.45, 4.0);
-        if (cur_ppp - target_ppp).abs() > 0.015 {
+        if (cur_ppp - target_ppp).abs() > 0.02 {
             ctx.set_pixels_per_point(target_ppp);
+            ctx.request_repaint();
         }
         1.0
+    }
+
+    fn visible_input_indices(&self) -> Vec<usize> {
+        self.input_order
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                if idx >= NUM_INPUT_STRIPS {
+                    return false;
+                }
+                let pair = idx / 2;
+                !(self.input_pair_stereo[pair] && idx % 2 == 1)
+            })
+            .collect()
+    }
+
+    fn move_input_strip(&mut self, strip_idx: usize, delta: i8) {
+        if strip_idx >= NUM_INPUT_STRIPS || delta == 0 {
+            return;
+        }
+        let vis = self.visible_input_indices();
+        let Some(vis_pos) = vis.iter().position(|&id| id == strip_idx) else {
+            return;
+        };
+        let target_vis_pos = if delta < 0 {
+            if vis_pos == 0 {
+                return;
+            }
+            vis_pos - 1
+        } else {
+            if vis_pos + 1 >= vis.len() {
+                return;
+            }
+            vis_pos + 1
+        };
+        let other_idx = vis[target_vis_pos];
+        let Some(pos_a) = self.input_order.iter().position(|&id| id == strip_idx) else {
+            return;
+        };
+        let Some(pos_b) = self.input_order.iter().position(|&id| id == other_idx) else {
+            return;
+        };
+        self.input_order.swap(pos_a, pos_b);
+        self.remote_state_dirty = true;
     }
 
     fn visible_strip_indices(&self) -> Vec<usize> {
         let mut res = Vec::new();
         if self.view_filter != StripViewFilter::BusesOnly {
-            let (p_start, p_end) = match self.input_bank {
-                InputBankFilter::All => (0, MAX_INPUT_PAIRS),
-                InputBankFilter::Bank1 => (0, 4),
-                InputBankFilter::Bank2 => (4, MAX_INPUT_PAIRS),
-            };
-            for p in p_start..p_end {
-                let base = p * 2;
-                res.push(base);
-                if !self.input_pair_stereo[p] {
-                    res.push(base + 1);
-                }
+            let active_inputs = self.visible_input_indices();
+            match self.input_bank {
+                InputBankFilter::All => res.extend(active_inputs),
+                InputBankFilter::Bank1 => res.extend(active_inputs.into_iter().take(8)),
+                InputBankFilter::Bank2 => res.extend(active_inputs.into_iter().skip(8)),
             }
         }
         if self.view_filter != StripViewFilter::InputsOnly {
@@ -802,6 +972,7 @@ impl UmcMixerApp {
             out_channels: usize,
             input_pair_stereo: [bool; MAX_INPUT_PAIRS],
             aux_pair_stereo: [bool; MAX_AUX_PAIRS],
+            input_order: &'a [usize],
             midi_ports: &'a [String],
             strips: &'a [StripState],
             player: RemotePlayerFull<'a>,
@@ -822,6 +993,7 @@ impl UmcMixerApp {
             out_channels: out_ch,
             input_pair_stereo: self.input_pair_stereo,
             aux_pair_stereo: self.aux_pair_stereo,
+            input_order: &self.input_order,
             midi_ports: self.midi_manager.ports(),
             strips: &self.strips,
             player: RemotePlayerFull {
@@ -958,6 +1130,15 @@ impl UmcMixerApp {
                     self.send(MixerCommand::SetStripMidiDevice { strip, filter });
                 }
             }
+            RemoteCommand::SetStripName { strip, name } => {
+                if strip < self.strips.len() {
+                    self.strips[strip].name = name.chars().take(16).collect();
+                    self.remote_state_dirty = true;
+                }
+            }
+            RemoteCommand::MoveInputStrip { strip, delta } => {
+                self.move_input_strip(strip, delta);
+            }
             RemoteCommand::BypassInsert { strip, slot, bypassed } => {
                 if strip < self.strips.len() && slot < MAX_INSERTS_PER_STRIP {
                     self.strips[strip].inserts[slot].bypassed = bypassed;
@@ -1045,6 +1226,10 @@ impl eframe::App for UmcMixerApp {
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
 
         let scale = self.apply_window_resize_scale(ctx);
+        if self.applied_theme != Some(self.theme) {
+            self.theme.apply_to_ctx(ctx);
+            self.applied_theme = Some(self.theme);
+        }
         let active_sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48000);
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
@@ -1223,6 +1408,11 @@ impl eframe::App for UmcMixerApp {
                             ui.selectable_value(&mut self.scale_mode, mode, mode.label());
                         }
                     });
+                    ui.menu_button(format!("Thème : {}", self.theme.label()), |ui| {
+                        for theme_opt in UiTheme::ALL {
+                            ui.selectable_value(&mut self.theme, theme_opt, theme_opt.label());
+                        }
+                    });
                     ui.separator();
                     ui.checkbox(&mut self.show_player_bar, "Afficher lecteur MP3/WAV");
                 });
@@ -1271,6 +1461,14 @@ impl eframe::App for UmcMixerApp {
                             ui.weak(format!("Port OSC UDP : {osc_p}"));
                         }
                     }
+                });
+
+                // Menu À propos
+                ui.menu_button("À propos", |ui| {
+                    ui.strong("UMC1820 Studio Mixer");
+                    ui.label("imaginé par Kapi");
+                    ui.separator();
+                    ui.weak("Console CoreAudio / ALSA · Plugins AU / VST3 / VST2 · iPad Remote");
                 });
 
                 // Accès rapide à droite : infos moteur + switch banque + alertes
@@ -1332,7 +1530,7 @@ impl eframe::App for UmcMixerApp {
                     egui::RichText::new(&self.player_title)
                         .monospace()
                         .size(11.5)
-                        .color(Color32::from_rgb(226, 232, 240)),
+                        .color(self.theme.text_primary()),
                 );
 
                 let has_track = self.player_progress.duration_secs > 0.0;
@@ -1487,11 +1685,9 @@ impl UmcMixerApp {
     fn draw_strip(&mut self, ui: &mut egui::Ui, idx: usize, scale: f32) {
         let kind = self.strips[idx].kind;
         let is_master = kind == StripKind::Master;
-        let bg = match kind {
-            StripKind::Input => Color32::from_rgb(19, 23, 32),
-            StripKind::Aux => Color32::from_rgb(17, 25, 36),
-            StripKind::Master => Color32::from_rgb(26, 22, 24),
-        };
+        let bg = self.theme.strip_bg(kind);
+        let border_col = self.theme.strip_border();
+        let is_light = self.theme.is_light();
 
         let in_ch_count = self.engine.as_ref().map(|e| e.in_channels).unwrap_or(8).max(2);
         let out_ch_count = self.engine.as_ref().map(|e| e.out_channels).unwrap_or(10).max(2);
@@ -1503,20 +1699,76 @@ impl UmcMixerApp {
         let aux_knob_sz = (21.0 * scale).clamp(15.0, 26.0);
         let fader_h = (114.0 * scale).clamp(76.0, 146.0);
 
+        let vis_inputs = if kind == StripKind::Input {
+            self.visible_input_indices()
+        } else {
+            Vec::new()
+        };
+        let input_vis_pos = vis_inputs.iter().position(|&id| id == idx);
+        let can_move_left = input_vis_pos.map_or(false, |p| p > 0);
+        let can_move_right = input_vis_pos.map_or(false, |p| p + 1 < vis_inputs.len());
+        let mut pending_move: i8 = 0;
+
         egui::Frame::none()
             .fill(bg)
-            .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(35, 41, 54)))
+            .stroke(egui::Stroke::new(1.0_f32, border_col))
             .inner_margin((6.0 * scale).clamp(4.0, 8.0))
             .rounding(4.0)
             .show(ui, |ui| {
                 ui.set_width(strip_w);
                 ui.spacing_mut().item_spacing.y = (3.0 * scale).clamp(2.0, 5.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(
-                        egui::RichText::new(&self.strips[idx].name)
-                            .strong()
-                            .size((12.0 * scale).clamp(9.5, 14.0)),
-                    );
+                    // Nom éditable (compatible macOS/Linux) + boutons déplacement ◀ ▶ sur les tranches d'entrée
+                    let name_font_sz = (11.5 * scale).clamp(9.5, 13.5);
+                    if kind == StripKind::Input {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            if ui
+                                .add_enabled(
+                                    can_move_left,
+                                    egui::Button::new(egui::RichText::new("◀").size(text_sm))
+                                        .min_size(egui::vec2(16.0, 18.0)),
+                                )
+                                .on_hover_text("Déplacer la piste d'entrée vers la gauche")
+                                .clicked()
+                            {
+                                pending_move = -1;
+                            }
+                            let edit_w = (strip_w - 40.0).max(40.0);
+                            let name_resp = ui.add_sized(
+                                [edit_w, 19.0],
+                                egui::TextEdit::singleline(&mut self.strips[idx].name)
+                                    .horizontal_align(egui::Align::Center)
+                                    .font(egui::FontId::proportional(name_font_sz))
+                                    .char_limit(16),
+                            );
+                            if name_resp.changed() {
+                                self.remote_state_dirty = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    can_move_right,
+                                    egui::Button::new(egui::RichText::new("▶").size(text_sm))
+                                        .min_size(egui::vec2(16.0, 18.0)),
+                                )
+                                .on_hover_text("Déplacer la piste d'entrée vers la droite")
+                                .clicked()
+                            {
+                                pending_move = 1;
+                            }
+                        });
+                    } else {
+                        let name_resp = ui.add_sized(
+                            [strip_w - 4.0, 19.0],
+                            egui::TextEdit::singleline(&mut self.strips[idx].name)
+                                .horizontal_align(egui::Align::Center)
+                                .font(egui::FontId::proportional(name_font_sz))
+                                .char_limit(16),
+                        );
+                        if name_resp.changed() {
+                            self.remote_state_dirty = true;
+                        }
+                    }
 
                     // Sélecteur d'entrée (Input) + Sélecteur de sortie sur CHAQUE tranche
                     if kind == StripKind::Input {
@@ -1756,17 +2008,27 @@ impl UmcMixerApp {
                                 egui::RichText::new(label)
                                     .size(text_sm)
                                     .color(if !has_plugin {
-                                        Color32::from_rgb(130, 142, 165)
+                                        self.theme.text_muted()
                                     } else if slot_state.bypassed {
                                         Color32::from_rgb(120, 128, 145)
                                     } else if native_open {
-                                        Color32::from_rgb(125, 211, 252)
+                                        if is_light {
+                                            Color32::from_rgb(3, 105, 161)
+                                        } else {
+                                            Color32::from_rgb(125, 211, 252)
+                                        }
                                     } else {
-                                        Color32::from_rgb(226, 232, 240)
+                                        self.theme.text_primary()
                                     }),
                             )
                             .fill(if has_plugin && !slot_state.bypassed {
-                                Color32::from_rgb(26, 36, 54)
+                                if is_light {
+                                    Color32::from_rgb(219, 234, 254)
+                                } else {
+                                    Color32::from_rgb(26, 36, 54)
+                                }
+                            } else if is_light {
+                                Color32::from_rgb(235, 240, 247)
                             } else {
                                 Color32::from_rgb(15, 19, 28)
                             });
@@ -1780,13 +2042,18 @@ impl UmcMixerApp {
                             if resp.clicked() {
                                 self.active_insert_target = Some((idx, slot));
                                 self.modal_show_catalog = !has_plugin;
-                                if has_plugin && !self.native_editors.is_open(idx, slot) {
-                                    if let Some(handle) = self.native_handles[idx][slot].clone() {
-                                        if let Err(err) =
-                                            self.native_editors.open_editor(idx, slot, &handle)
-                                        {
-                                            self.last_native_ui_error = Some((idx, slot, err));
+                                if has_plugin {
+                                    if !self.native_editors.is_open(idx, slot) {
+                                        if let Some(handle) = self.native_handles[idx][slot].clone() {
+                                            if let Err(err) = self
+                                                .native_editors
+                                                .open_editor(idx, slot, &handle)
+                                            {
+                                                self.last_native_ui_error = Some((idx, slot, err));
+                                            }
                                         }
+                                    } else {
+                                        self.native_editors.focus_slot(idx, slot);
                                     }
                                 }
                             }
@@ -1924,6 +2191,9 @@ impl UmcMixerApp {
                     );
                 });
             });
+        if pending_move != 0 {
+            self.move_input_strip(idx, pending_move);
+        }
     }
 
     fn draw_plugin_picker_modal(&mut self, ctx: &egui::Context) {

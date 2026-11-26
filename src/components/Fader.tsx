@@ -101,7 +101,7 @@ export const Fader: React.FC<FaderProps> = ({
       })}
 
       {/* Center slot */}
-      <div className="w-1 h-[calc(100%-20px)] bg-[#07090D] border border-[#232936] rounded-full" />
+      <div className="w-1 h-[calc(100%-20px)] bg-[var(--fader-slot)] border border-[var(--border-main)] rounded-full" />
 
       {/* Fader cap */}
       <div

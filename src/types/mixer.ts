@@ -82,6 +82,13 @@ export type InputPairStereoState = [
 ];
 export type AudioBufferLatencyPreset = 64 | 128 | 256 | 512 | 1024 | 2048;
 
+export type UiThemeId =
+  | 'noir_studio'
+  | 'nuit_console'
+  | 'ardoise'
+  | 'titane'
+  | 'lumiere_jour';
+
 export interface MidiPortInfo {
   id: string;
   name: string;
@@ -121,6 +128,7 @@ export interface MixerSetSnapshot {
   version: number;
   inputPairStereo?: InputPairStereoState;
   auxPairStereo: AuxPairStereoState;
+  inputOrder?: number[];
   bufferFrames?: AudioBufferLatencyPreset;
   strips: StripState[];
   playerLoop?: boolean;

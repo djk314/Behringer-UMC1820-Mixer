@@ -73,7 +73,18 @@
     .strip.aux { background: var(--strip-aux); border-color: rgba(56,189,248,0.25); }
     .strip.master { background: var(--strip-master); border-color: rgba(245,158,11,0.35); }
     .strip-head { display: flex; flex-direction: column; gap: 4px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
-    .strip-name { font-size: 13px; font-weight: 700; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .strip-title-row { display: flex; align-items: center; gap: 3px; }
+    .strip-move-btn {
+      padding: 2px 5px; font-size: 10px; line-height: 1.1; border-radius: 4px;
+      background: #0b0e14; border: 1px solid var(--border); color: var(--muted); flex-shrink: 0;
+    }
+    .strip-move-btn:disabled { opacity: 0.3; cursor: default; }
+    .strip-name-input {
+      flex: 1; min-width: 0; width: 100%; background: transparent; color: var(--text);
+      border: 1px solid transparent; border-radius: 4px; padding: 2px 4px;
+      font-size: 12px; font-weight: 700; text-align: center;
+    }
+    .strip-name-input:focus { outline: none; background: #0b0e14; border-color: var(--amber); }
     .strip-sub { font-size: 10px; font-family: ui-monospace, monospace; color: var(--muted); text-align: center; }
     .io-select { width: 100%; font-size: 11px; padding: 5px 6px; background: #0b0e14; }
     .sec { border-bottom: 1px solid var(--border); padding-bottom: 6px; display: flex; flex-direction: column; gap: 4px; }
@@ -146,6 +157,13 @@
       padding: 12px 14px; border-bottom: 1px solid var(--border); font-weight: 700; font-size: 14px;
     }
     .modal-body { padding: 12px 14px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+    @media (max-width: 640px) {
+      .topbar { padding: 6px 8px; gap: 6px; }
+      .brand { font-size: 13px; gap: 6px; }
+      #hwInfo { display: none; }
+      button { padding: 5px 8px; font-size: 11px; }
+      .mixer-scroll { padding: 6px; gap: 6px; }
+    }
   </style>
 </head>
 <body>
@@ -153,22 +171,20 @@
   <header class="topbar">
     <div class="brand">
       <span>UMC1820 Remote</span>
+      <span style="font-size:10px;color:#94a3b8;font-weight:400;">· imaginé par Kapi</span>
       <span id="wsBadge" class="badge wait">Connexion...</span>
       <span id="hwInfo" class="badge" style="color:#94a3b8;">--</span>
     </div>
     <div class="controls">
       <button id="viewAll" class="active-amber" onclick="setView('all')">Toutes</button>
-      <button id="viewIn" onclick="setView('inputs')">Entrées</button>
       <button id="viewBus" onclick="setView('buses')">Aux &amp; Master</button>
-      <button id="inModeBtn" class="active-sky" onclick="toggleAllInputs()">Entrées: 8 Stéréo → 16 Mono</button>
-      <button id="inBankBtn" onclick="cycleInputBank()">Banque IN: Tout</button>
-      <button id="auxModeBtn" class="active-sky" onclick="toggleAllAux()">Aux: 4 Stéréo</button>
+      <button id="inBankBtn" style="display:none;" onclick="cycleInputBank()">Banque IN: Tout</button>
       <button id="clearSoloBtn" style="display:none;" class="active-amber" onclick="sendCmd({type:'clear_all_solo'})">Off Solo</button>
-      <button onclick="togglePlayerBar()">Lecteur</button>
+      <button id="playerToggleBtn" onclick="togglePlayerBar()">Lecteur</button>
     </div>
   </header>
 
-  <div id="playerBar" class="playerbar">
+  <div id="playerBar" class="playerbar" style="display:none;">
     <strong style="color:#38bdf8;">MP3/WAV</strong>
     <span id="plTitle" class="player-title">Aucun fichier</span>
     <button onclick="sendCmd({type:'player_play'})">▶</button>
@@ -201,16 +217,16 @@
   let state = null;
   let currentView = 'all';
   let inputBank = 'all'; // 'all' | 'b1' (1..8) | 'b2' (9..16)
-  let showPlayer = true;
+  let showPlayer = false;
   let activeDragKey = null;
   let modalTarget = null;
   let reconnectTimer = null;
 
   function setView(v) {
-    currentView = v;
-    document.getElementById('viewAll').className = v === 'all' ? 'active-amber' : '';
-    document.getElementById('viewIn').className = v === 'inputs' ? 'active-amber' : '';
-    document.getElementById('viewBus').className = v === 'buses' ? 'active-amber' : '';
+    currentView = v === 'buses' ? 'buses' : 'all';
+    document.getElementById('viewAll').className = currentView === 'all' ? 'active-amber' : '';
+    document.getElementById('viewBus').className = currentView === 'buses' ? 'active-amber' : '';
+    updateInputBankButton();
     renderMixer();
   }
 
@@ -223,6 +239,9 @@
   function updateInputBankButton() {
     const btn = document.getElementById('inBankBtn');
     if (!btn) return;
+    const showBank = currentView === 'all' && getVisibleInputIndices().length > 8;
+    btn.style.display = showBank ? 'inline-block' : 'none';
+    if (!showBank && inputBank !== 'all') inputBank = 'all';
     btn.textContent = inputBank === 'b1' ? 'Banque IN: 1–8' : inputBank === 'b2' ? 'Banque IN: 9–16' : 'Banque IN: Tout';
     btn.className = inputBank === 'all' ? '' : 'active-amber';
   }
@@ -230,41 +249,14 @@
   function togglePlayerBar() {
     showPlayer = !showPlayer;
     document.getElementById('playerBar').style.display = showPlayer ? 'flex' : 'none';
+    const btn = document.getElementById('playerToggleBtn');
+    if (btn) btn.className = showPlayer ? 'active-sky' : '';
   }
 
   function sendCmd(obj) {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(obj));
     }
-  }
-
-  function toggleAllInputs() {
-    if (!state || !Array.isArray(state.input_pair_stereo)) return;
-    const allStereo = state.input_pair_stereo.every(Boolean);
-    const target = !allStereo;
-    for (let p = 0; p < state.input_pair_stereo.length; p++) {
-      state.input_pair_stereo[p] = target;
-      sendCmd({ type: 'set_input_pair_stereo', pair: p, stereo: target });
-    }
-    if (!target && inputBank === 'all') {
-      inputBank = 'b1';
-      updateInputBankButton();
-    } else if (target) {
-      inputBank = 'all';
-      updateInputBankButton();
-    }
-    renderMixer();
-  }
-
-  function toggleAllAux() {
-    if (!state) return;
-    const allStereo = state.aux_pair_stereo.every(Boolean);
-    const target = !allStereo;
-    for (let p = 0; p < 4; p++) {
-      state.aux_pair_stereo[p] = target;
-      sendCmd({ type: 'set_aux_pair_stereo', pair: p, stereo: target });
-    }
-    renderMixer();
   }
 
   function togglePlayerLoop() {
@@ -345,16 +337,7 @@
     document.getElementById('hwInfo').textContent = `${state.device} · ${buf}smp (${ms}ms) · ${state.in_channels}IN/${state.out_channels}OUT`;
     const anySolo = state.strips.some(s => s.kind !== 'Master' && s.solo);
     document.getElementById('clearSoloBtn').style.display = anySolo ? 'inline-block' : 'none';
-    const inPairs = state.input_pair_stereo || [true, true, true, true, true, true, true, true];
-    const allInStereo = inPairs.every(Boolean);
-    const inBtn = document.getElementById('inModeBtn');
-    inBtn.textContent = allInStereo ? 'Entrées: 8 Stéréo → 16 Mono' : 'Entrées: Mono → 8 Stéréo';
-    inBtn.className = allInStereo ? 'active-sky' : 'active-emerald';
     updateInputBankButton();
-    const allStereo = state.aux_pair_stereo.every(Boolean);
-    const auxBtn = document.getElementById('auxModeBtn');
-    auxBtn.textContent = allStereo ? 'Aux: 4 Stéréo → Mono' : 'Aux: Mono → 4 Stéréo';
-    auxBtn.className = allStereo ? 'active-sky' : 'active-emerald';
     updatePlayerUI();
 
     if (!activeDragKey) {
@@ -420,20 +403,27 @@
     }
   }
 
+  function getVisibleInputIndices() {
+    if (!state || !Array.isArray(state.strips)) return [];
+    const inPairs = state.input_pair_stereo || [true, true, true, true, true, true, true, true];
+    const inCount = inPairs.length * 2;
+    const rawOrder = Array.isArray(state.input_order) && state.input_order.length === inCount
+      ? state.input_order
+      : Array.from({ length: inCount }, (_, i) => i);
+    return rawOrder.filter((idx) => !(inPairs[Math.floor(idx / 2)] && idx % 2 === 1));
+  }
+
   function getVisibleIndices() {
     if (!state || !Array.isArray(state.strips)) return [];
     const res = [];
-    const inPairs = state.input_pair_stereo || [true, true, true, true, true, true, true, true];
     const auxBase = state.strips.findIndex(s => s.kind === 'Aux');
     const masterIdx = state.strips.findIndex(s => s.kind === 'Master');
 
     if (currentView !== 'buses') {
-      const pStart = inputBank === 'b2' ? 4 : 0;
-      const pEnd = inputBank === 'b1' ? 4 : inPairs.length;
-      for (let p = pStart; p < pEnd; p++) {
-        res.push(p * 2);
-        if (!inPairs[p]) res.push(p * 2 + 1);
-      }
+      const activeInputs = getVisibleInputIndices();
+      if (inputBank === 'b1') res.push(...activeInputs.slice(0, 8));
+      else if (inputBank === 'b2') res.push(...activeInputs.slice(8));
+      else res.push(...activeInputs);
     }
     if (currentView !== 'inputs' && auxBase >= 0) {
       for (let p = 0; p < 4; p++) {
@@ -445,40 +435,25 @@
     return res;
   }
 
-  function encodeInputRoute(r) {
-    if (!r || r === 'None') return 'none:0';
-    if (r.Mono !== undefined) return `mono:${r.Mono}`;
-    if (r.StereoPair !== undefined) return `stereo:${r.StereoPair}`;
-    return 'none:0';
+  function formatInputSub(r) {
+    if (!r || r === 'None') return 'Synth / Off';
+    if (r.Mono !== undefined) return `In ${r.Mono + 1} (Mono)`;
+    if (r.StereoPair !== undefined) return `In ${r.StereoPair + 1}/${r.StereoPair + 2}`;
+    return '';
   }
 
-  function encodeOutputRoute(r) {
-    if (!r || r === 'None') return 'none:0';
-    if (r === 'MasterBus') return 'master:0';
-    if (r.Mono !== undefined) return `mono:${r.Mono}`;
-    if (r.StereoPair !== undefined) return `stereo:${r.StereoPair}`;
-    return 'none:0';
-  }
-
-  function encodeMidiDevice(d) {
-    if (!d || d === 'All') return 'all';
-    if (d === 'None') return 'none';
-    if (d.Port !== undefined) return String(d.Port);
-    return 'all';
-  }
-
-  function encodeMidiMode(m) {
-    if (m === null || m === undefined) return 'off';
-    return String(m);
+  function formatOutputSub(r) {
+    if (!r || r === 'None') return 'Sortie Off';
+    if (r === 'MasterBus') return 'Master';
+    if (r.Mono !== undefined) return `Out ${r.Mono + 1}`;
+    if (r.StereoPair !== undefined) return `Out ${r.StereoPair + 1}/${r.StereoPair + 2}`;
+    return '';
   }
 
   function renderMixer() {
     if (!state) return;
     const container = document.getElementById('mixerScroll');
     const indices = getVisibleIndices();
-    const inCh = Math.max(8, state.in_channels || 8);
-    const outCh = Math.max(10, state.out_channels || 10);
-    const inPairs = state.input_pair_stereo || [true, true, true, true, true, true, true, true];
     const auxBase = state.strips.findIndex(s => s.kind === 'Aux');
 
     container.innerHTML = indices.map((idx) => {
@@ -487,44 +462,17 @@
       const isMaster = st.kind === 'Master';
       const isAux = st.kind === 'Aux';
       const isInput = st.kind === 'Input';
-      const inPairIdx = isInput ? Math.floor(idx / 2) : -1;
-      const isInStereo = isInput && Boolean(inPairs[inPairIdx]);
       const auxPairIdx = isAux && auxBase >= 0 ? Math.floor((idx - auxBase) / 2) : -1;
       const isAuxStereo = isAux && auxPairIdx >= 0 && state.aux_pair_stereo[auxPairIdx];
 
-      let outOpts = `<option value="none:0">Sortie: Aucune</option>`;
-      if (isInput || isAux) outOpts += `<option value="master:0">Vers Master</option>`;
-      for (let c = 0; c + 1 < outCh; c += 2) outOpts += `<option value="stereo:${c}">Out ${c + 1}/${c + 2} (Stéréo)</option>`;
-      for (let c = 0; c < outCh; c++) outOpts += `<option value="mono:${c}">Out ${c + 1} (Mono)</option>`;
-
-      let ioHtml = '';
-      if (isInput) {
-        let inOpts = `<option value="none:0">Aucune / Synth</option>`;
-        for (let c = 0; c < inCh; c++) inOpts += `<option value="mono:${c}">In ${c + 1} (Mono)</option>`;
-        for (let c = 0; c + 1 < inCh; c += 2) inOpts += `<option value="stereo:${c}">In ${c + 1}/${c + 2} (Stéréo)</option>`;
-        ioHtml = `
-          <select class="io-select in-select" onchange="onInputRoute(${idx}, this.value)">${inOpts}</select>
-          <select class="io-select out-select" onchange="onOutputRoute(${idx}, this.value)">${outOpts}</select>`;
-      } else {
-        ioHtml = `<select class="io-select out-select" onchange="onOutputRoute(${idx}, this.value)">${outOpts}</select>`;
-      }
-
-      const midiPorts = Array.isArray(state.midi_ports) ? state.midi_ports : [];
-      const curMidiDev = encodeMidiDevice(st.midi_device);
-      let midiDevOpts = `<option value="all">MIDI: Tous</option><option value="none">MIDI: Aucun</option>`;
-      midiPorts.forEach((p) => { midiDevOpts += `<option value="${esc(p)}">MIDI: ${esc(p)}</option>`; });
-      if (curMidiDev !== 'all' && curMidiDev !== 'none' && !midiPorts.includes(curMidiDev)) {
-        midiDevOpts += `<option value="${esc(curMidiDev)}">MIDI: ${esc(curMidiDev)}</option>`;
-      }
-      let midiChOpts = `<option value="off">Canal: OFF</option><option value="0">Canal: OMNI</option>`;
-      for (let ch = 1; ch <= 16; ch++) midiChOpts += `<option value="${ch}">Canal: CH ${ch}</option>`;
+      const stripSub = isInput
+        ? formatInputSub(st.input_route)
+        : isAux
+          ? `${isAuxStereo ? 'AUX STÉRÉO' : 'AUX MONO'} · ${formatOutputSub(st.output_route)}`
+          : `MASTER · ${formatOutputSub(st.output_route)}`;
 
       const topCtrlHtml = isInput
         ? `<div class="sec">
-             <button class="${isInStereo ? 'active-sky' : 'active-emerald'}" style="padding:4px;font-size:10px;"
-               onclick="sendCmd({type:'set_input_pair_stereo',pair:${inPairIdx},stereo:${!isInStereo}})">
-               ${isInStereo ? 'Stéréo → Mono' : 'Mono → Stéréo'}
-             </button>
              <div class="slider-row">
                <div class="slider-lbl"><span>GAIN</span><span id="gain-lbl-${idx}">${st.gain_db >= 0 ? '+' : ''}${st.gain_db.toFixed(1)} dB</span></div>
                <input type="range" min="-12" max="24" step="0.5" value="${st.gain_db}"
@@ -532,17 +480,8 @@
                  ondblclick="onGain(${idx},0);this.value=0"
                  oninput="onGain(${idx}, Number(this.value))" />
              </div>
-             <select class="io-select midi-dev-select" onchange="onMidiDevice(${idx}, this.value)">${midiDevOpts}</select>
-             <select class="io-select midi-ch-select" onchange="onMidiMode(${idx}, this.value)">${midiChOpts}</select>
            </div>`
-        : isAux
-          ? `<div class="sec">
-               <button class="${isAuxStereo ? 'active-sky' : 'active-emerald'}" style="padding:5px;font-size:11px;"
-                 onclick="sendCmd({type:'set_aux_pair_stereo',pair:${auxPairIdx},stereo:${!isAuxStereo}})">
-                 ${isAuxStereo ? 'Stéréo → Séparer Mono' : 'Mono → Lier Stéréo'}
-               </button>
-             </div>`
-          : `<div class="sec"><div class="strip-sub" style="padding:4px 0;">BUS PRINCIPAL</div></div>`;
+        : `<div class="sec"><div class="strip-sub" style="padding:4px 0;">${isAux ? (isAuxStereo ? 'BUS AUX STÉRÉO' : 'BUS AUX MONO') : 'BUS PRINCIPAL'}</div></div>`;
 
       const activeInserts = st.inserts
         .map((ins, sl) => ({ ins, sl }))
@@ -604,11 +543,20 @@
       const zeroPct = dbToPct(0);
       const thumbTop = (100 - fPct) * 1.46; // 170 - 24 = 146px travel
 
+      const visibleInList = isInput ? getVisibleInputIndices() : [];
+      const visInPos = isInput ? visibleInList.indexOf(idx) : -1;
+      const canMoveLeft = isInput && visInPos > 0;
+      const canMoveRight = isInput && visInPos >= 0 && visInPos + 1 < visibleInList.length;
+
       return `
         <section class="strip ${kindCls}">
           <div class="strip-head">
-            <div class="strip-name">${esc(st.name)}</div>
-            ${ioHtml}
+            <div class="strip-title-row">
+              ${isInput ? `<button class="strip-move-btn" ${canMoveLeft ? '' : 'disabled'} onclick="moveInputStrip(${idx}, -1)" title="Déplacer à gauche">◀</button>` : ''}
+              <input class="strip-name-input" type="text" maxlength="16" value="${esc(st.name)}" onchange="onStripName(${idx}, this.value)" />
+              ${isInput ? `<button class="strip-move-btn" ${canMoveRight ? '' : 'disabled'} onclick="moveInputStrip(${idx}, 1)" title="Déplacer à droite">▶</button>` : ''}
+            </div>
+            <div class="strip-sub">${esc(stripSub)}</div>
           </div>
           ${topCtrlHtml}
           <div class="sec">
@@ -647,20 +595,8 @@
         </section>`;
     }).join('');
 
-    // Restore selected I/O & MIDI values & attach touch fader listeners
+    // Attach touch fader listeners
     indices.forEach((idx) => {
-      const st = state.strips[idx];
-      const sec = container.querySelector(`#fader-${idx}`)?.closest('.strip');
-      if (sec) {
-        const inSel = sec.querySelector('.in-select');
-        if (inSel) inSel.value = encodeInputRoute(st.input_route);
-        const outSel = sec.querySelector('.out-select');
-        if (outSel) outSel.value = encodeOutputRoute(st.output_route);
-        const midiDevSel = sec.querySelector('.midi-dev-select');
-        if (midiDevSel) midiDevSel.value = encodeMidiDevice(st.midi_device);
-        const midiChSel = sec.querySelector('.midi-ch-select');
-        if (midiChSel) midiChSel.value = encodeMidiMode(st.midi_mode);
-      }
       attachFaderTouch(idx);
     });
   }
@@ -713,24 +649,29 @@
     sendCmd({ type: 'set_volume', strip: idx, volume_db: db });
   }
 
-  function onInputRoute(idx, val) {
-    const [kind, ch] = val.split(':');
-    sendCmd({ type: 'set_input_route', strip: idx, kind, channel: Number(ch) || 0 });
+  function onStripName(idx, name) {
+    if (state?.strips[idx]) state.strips[idx].name = name;
+    sendCmd({ type: 'set_strip_name', strip: idx, name });
   }
-  function onOutputRoute(idx, val) {
-    const [kind, ch] = val.split(':');
-    sendCmd({ type: 'set_output_route', strip: idx, kind, channel: Number(ch) || 0 });
-  }
-  function onMidiDevice(idx, val) {
-    if (state?.strips[idx]) {
-      state.strips[idx].midi_device = val === 'all' ? 'All' : val === 'none' ? 'None' : { Port: val };
+  function moveInputStrip(idx, delta) {
+    if (!state) return;
+    const vis = getVisibleInputIndices();
+    const pos = vis.indexOf(idx);
+    const targetPos = pos + delta;
+    if (pos < 0 || targetPos < 0 || targetPos >= vis.length) return;
+    if (!Array.isArray(state.input_order) || state.input_order.length !== 16) {
+      state.input_order = Array.from({ length: 16 }, (_, i) => i);
     }
-    sendCmd({ type: 'set_strip_midi_device', strip: idx, device: val });
-  }
-  function onMidiMode(idx, val) {
-    const mode = val === 'off' ? null : Number(val);
-    if (state?.strips[idx]) state.strips[idx].midi_mode = mode;
-    sendCmd({ type: 'set_strip_midi_mode', strip: idx, mode });
+    const otherIdx = vis[targetPos];
+    const a = state.input_order.indexOf(idx);
+    const b = state.input_order.indexOf(otherIdx);
+    if (a >= 0 && b >= 0) {
+      const tmp = state.input_order[a];
+      state.input_order[a] = state.input_order[b];
+      state.input_order[b] = tmp;
+    }
+    sendCmd({ type: 'move_input_strip', strip: idx, delta });
+    renderMixer();
   }
   function onGain(idx, db) {
     if (state?.strips[idx]) state.strips[idx].gain_db = db;

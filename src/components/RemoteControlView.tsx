@@ -54,7 +54,7 @@ export const RemoteControlView: React.FC<RemoteControlViewProps> = ({
           <div className="bg-[#0B0E14] border border-[#232936] rounded p-3">
             <div className="font-semibold text-emerald-300 mb-1">3. Contrôle temps réel</div>
             <div className="text-slate-400 leading-relaxed">
-              Faders tactiles multi-touch, VU-mètres 20 Hz, Mute/Solo, Gain, EQ 5 bandes, Aux Stéréo/Mono, I/O matériel, paramètres de plugins et lecteur MP3/WAV.
+              Faders tactiles multi-touch, VU-mètres 20 Hz, Mute/Solo, Gain, EQ 5 bandes, envois Aux, paramètres de plugins et lecteur MP3/WAV.
             </div>
           </div>
         </div>

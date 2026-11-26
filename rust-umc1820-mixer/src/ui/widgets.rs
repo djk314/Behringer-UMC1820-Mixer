@@ -35,15 +35,21 @@ pub fn rotary_knob(
         let radius = size * 0.42;
         let norm = ((*value - *range.start()) / (*range.end() - *range.start())).clamp(0.0, 1.0);
 
+        let is_dark = ui.visuals().dark_mode;
+        let arc_bg = if is_dark { Color32::from_rgb(38, 45, 58) } else { Color32::from_rgb(185, 194, 208) };
+        let knob_fill = if is_dark { Color32::from_rgb(24, 29, 40) } else { Color32::from_rgb(56, 65, 82) };
+        let knob_stroke = if is_dark { Color32::from_rgb(56, 65, 82) } else { Color32::from_rgb(110, 122, 142) };
+        let label_col = if is_dark { Color32::from_rgb(165, 175, 195) } else { Color32::from_rgb(45, 55, 72) };
+
         // Arc de fond (-135 deg à +135 deg)
         let start_angle = 0.75 * PI;
         let sweep = 1.5 * PI;
-        draw_arc(painter, center, radius + 3.0, start_angle, start_angle + sweep, Stroke::new(2.0_f32, Color32::from_rgb(38, 45, 58)));
+        draw_arc(painter, center, radius + 3.0, start_angle, start_angle + sweep, Stroke::new(2.0_f32, arc_bg));
         draw_arc(painter, center, radius + 3.0, start_angle, start_angle + sweep * norm, Stroke::new(2.5_f32, accent));
 
         // Corps du bouton rotatif
-        painter.circle_filled(center, radius, Color32::from_rgb(24, 29, 40));
-        painter.circle_stroke(center, radius, Stroke::new(1.0_f32, Color32::from_rgb(56, 65, 82)));
+        painter.circle_filled(center, radius, knob_fill);
+        painter.circle_stroke(center, radius, Stroke::new(1.0_f32, knob_stroke));
 
         // Curseur rotatif
         let angle = start_angle + sweep * norm;
@@ -57,7 +63,7 @@ pub fn rotary_knob(
             egui::Align2::CENTER_CENTER,
             format!("{label} {value:.0}{unit}"),
             egui::FontId::monospace(font_sz),
-            Color32::from_rgb(165, 175, 195),
+            label_col,
         );
     }
 
@@ -154,8 +160,21 @@ pub fn vu_meter(ui: &mut Ui, peak_l: f32, peak_r: f32, rms_l: f32, rms_r: f32, c
 }
 
 pub fn push_button(ui: &mut Ui, label: &str, active: &mut bool, active_color: Color32, scale: f32) -> bool {
-    let fill = if *active { active_color } else { Color32::from_rgb(27, 33, 45) };
-    let text_color = if *active { Color32::BLACK } else { Color32::from_rgb(180, 190, 205) };
+    let is_dark = ui.visuals().dark_mode;
+    let fill = if *active {
+        active_color
+    } else if is_dark {
+        Color32::from_rgb(27, 33, 45)
+    } else {
+        Color32::from_rgb(212, 220, 232)
+    };
+    let text_color = if *active {
+        Color32::BLACK
+    } else if is_dark {
+        Color32::from_rgb(180, 190, 205)
+    } else {
+        Color32::from_rgb(30, 41, 59)
+    };
     let font_sz = (10.5 * scale).clamp(8.5, 11.5);
     let min_w = (32.0 * scale).clamp(24.0, 42.0);
     let min_h = (21.0 * scale).clamp(17.0, 24.0);

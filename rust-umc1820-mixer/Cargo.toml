@@ -16,6 +16,7 @@ serde_json = "1.0"
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "wav", "pcm"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+eframe = { version = "0.29", features = ["wgpu"] }
 coreaudio-sys = { version = "0.2", features = ["audio_toolbox", "audio_unit", "core_audio"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

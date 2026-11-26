@@ -18,12 +18,15 @@ mod platform {
     };
     use std::ffi::{c_char, c_void, CString};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     #[link(name = "objc", kind = "dylib")]
     extern "C" {
         fn objc_getClass(name: *const c_char) -> *mut c_void;
         fn sel_registerName(name: *const c_char) -> *mut c_void;
         fn objc_msgSend();
+        fn objc_autoreleasePoolPush() -> *mut c_void;
+        fn objc_autoreleasePoolPop(pool: *mut c_void);
         #[cfg(target_arch = "x86_64")]
         fn objc_msgSend_stret();
     }
@@ -36,12 +39,14 @@ mod platform {
     #[link(name = "AppKit", kind = "framework")]
     extern "C" {}
 
+    #[link(name = "QuartzCore", kind = "framework")]
+    extern "C" {}
+
     #[link(name = "CoreAudioKit", kind = "framework")]
     extern "C" {}
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default)]
-    #[allow(dead_code)]
     struct NSPoint {
         x: f64,
         y: f64,
@@ -56,10 +61,28 @@ mod platform {
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default)]
-    #[allow(dead_code)]
     struct NSRect {
         origin: NSPoint,
         size: NSSize,
+    }
+
+    struct AutoreleasePoolGuard(*mut c_void);
+
+    impl AutoreleasePoolGuard {
+        unsafe fn new() -> Self {
+            Self(objc_autoreleasePoolPush())
+        }
+    }
+
+    impl Drop for AutoreleasePoolGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.0.is_null() {
+                    objc_autoreleasePoolPop(self.0);
+                    self.0 = std::ptr::null_mut();
+                }
+            }
+        }
     }
 
     #[inline]
@@ -89,8 +112,22 @@ mod platform {
     }
 
     #[inline]
+    unsafe fn msg0_usize(obj: *mut c_void, s: *mut c_void) -> usize {
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(obj, s)
+    }
+
+    #[inline]
     unsafe fn msg1_ptr(obj: *mut c_void, s: *mut c_void, arg: *mut c_void) -> *mut c_void {
         let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(obj, s, arg)
+    }
+
+    #[inline]
+    unsafe fn msg1_usize_ptr(obj: *mut c_void, s: *mut c_void, arg: usize) -> *mut c_void {
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void =
             std::mem::transmute(objc_msgSend as *const ());
         f(obj, s, arg)
     }
@@ -103,14 +140,34 @@ mod platform {
     }
 
     #[inline]
+    unsafe fn msg1_usize_void(obj: *mut c_void, s: *mut c_void, arg: usize) {
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void, usize) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(obj, s, arg);
+    }
+
+    #[inline]
     unsafe fn msg1_size_void(obj: *mut c_void, s: *mut c_void, arg: NSSize) {
         let f: unsafe extern "C" fn(*mut c_void, *mut c_void, NSSize) =
             std::mem::transmute(objc_msgSend as *const ());
         f(obj, s, arg);
     }
 
-    unsafe fn nsview_frame(view: *mut c_void) -> NSRect {
-        let s = sel(c"frame");
+    #[inline]
+    unsafe fn msg1_point_void(obj: *mut c_void, s: *mut c_void, arg: NSPoint) {
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void, NSPoint) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(obj, s, arg);
+    }
+
+    #[inline]
+    unsafe fn msg1_rect_void(obj: *mut c_void, s: *mut c_void, arg: NSRect) {
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void, NSRect) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(obj, s, arg);
+    }
+
+    unsafe fn nsview_rect_sel(view: *mut c_void, s: *mut c_void) -> NSRect {
         #[cfg(target_arch = "aarch64")]
         {
             let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> NSRect =
@@ -127,6 +184,106 @@ mod platform {
         }
     }
 
+    unsafe fn nsview_frame(view: *mut c_void) -> NSRect {
+        nsview_rect_sel(view, sel(c"frame"))
+    }
+
+    unsafe fn nsview_bounds(view: *mut c_void) -> NSRect {
+        nsview_rect_sel(view, sel(c"bounds"))
+    }
+
+    unsafe fn flush_ca_transaction() {
+        let ca_cls = objc_getClass(c"CATransaction".as_ptr());
+        if !ca_cls.is_null() {
+            msg0_void(ca_cls, sel(c"flush"));
+        }
+    }
+
+    /// Protège l'état NSOpenGLContext de la fenêtre hôte et draine les objets Cocoa autoreleased.
+    unsafe fn with_macos_ui_guard<T>(f: impl FnOnce() -> T) -> T {
+        let _pool = AutoreleasePoolGuard::new();
+        let gl_cls = objc_getClass(c"NSOpenGLContext".as_ptr());
+        let prev_gl = if !gl_cls.is_null() {
+            msg0(gl_cls, sel(c"currentContext"))
+        } else {
+            std::ptr::null_mut()
+        };
+
+        let out = f();
+
+        if !gl_cls.is_null() {
+            let cur_gl = msg0(gl_cls, sel(c"currentContext"));
+            if cur_gl != prev_gl {
+                if prev_gl.is_null() {
+                    msg0_void(gl_cls, sel(c"clearCurrentContext"));
+                } else {
+                    msg0_void(prev_gl, sel(c"makeCurrentContext"));
+                }
+            }
+        }
+        out
+    }
+
+    unsafe fn configure_host_content_view(window: *mut c_void) -> *mut c_void {
+        if window.is_null() {
+            return std::ptr::null_mut();
+        }
+        let content_view = msg0(window, sel(c"contentView"));
+        if !content_view.is_null() {
+            msg1_u8_void(content_view, sel(c"setWantsLayer:"), 1);
+            msg1_u8_void(content_view, sel(c"setAutoresizesSubviews:"), 1);
+        }
+        content_view
+    }
+
+    unsafe fn sync_content_view_subviews(window: *mut c_void, force_single_frame: bool) {
+        if window.is_null() {
+            return;
+        }
+        let content_view = configure_host_content_view(window);
+        if content_view.is_null() {
+            return;
+        }
+        let bounds = nsview_bounds(content_view);
+        let subviews = msg0(content_view, sel(c"subviews"));
+        if !subviews.is_null() {
+            let count = msg0_usize(subviews, sel(c"count"));
+            for i in 0..count {
+                let sub = msg1_usize_ptr(subviews, sel(c"objectAtIndex:"), i);
+                if !sub.is_null() {
+                    msg1_usize_void(sub, sel(c"setAutoresizingMask:"), 18);
+                    if force_single_frame && count == 1 {
+                        msg1_rect_void(sub, sel(c"setFrame:"), bounds);
+                    }
+                    msg1_u8_void(sub, sel(c"setNeedsDisplay:"), 1);
+                }
+            }
+        }
+        msg1_u8_void(content_view, sel(c"setNeedsDisplay:"), 1);
+        msg0_void(window, sel(c"displayIfNeeded"));
+    }
+
+    unsafe fn detach_all_subviews(content_view: *mut c_void) {
+        if content_view.is_null() {
+            return;
+        }
+        let subviews = msg0(content_view, sel(c"subviews"));
+        if subviews.is_null() {
+            return;
+        }
+        let count = msg0_usize(subviews, sel(c"count"));
+        let mut ptrs = Vec::with_capacity(count);
+        for i in 0..count {
+            let sub = msg1_usize_ptr(subviews, sel(c"objectAtIndex:"), i);
+            if !sub.is_null() {
+                ptrs.push(sub);
+            }
+        }
+        for sub in ptrs.into_iter().rev() {
+            msg0_void(sub, sel(c"removeFromSuperview"));
+        }
+    }
+
     unsafe fn make_nsstring(text: &str) -> *mut c_void {
         let c_text = CString::new(text).unwrap_or_else(|_| CString::new("Plugin").unwrap());
         let cls = objc_getClass(c"NSString".as_ptr());
@@ -136,7 +293,13 @@ mod platform {
         f(alloc, sel(c"initWithUTF8String:"), c_text.as_ptr())
     }
 
-    unsafe fn create_nswindow(width: f64, height: f64, title: &str, resizable: bool) -> *mut c_void {
+    unsafe fn create_nswindow(
+        width: f64,
+        height: f64,
+        title: &str,
+        resizable: bool,
+        cascade_idx: usize,
+    ) -> *mut c_void {
         let cls = objc_getClass(c"NSWindow".as_ptr());
         let alloc = msg0(cls, sel(c"alloc"));
         let rect = NSRect {
@@ -171,6 +334,14 @@ mod platform {
                 msg0_void(ns_title, sel(c"release"));
             }
             msg0_void(window, sel(c"center"));
+            if cascade_idx > 0 {
+                let step = (cascade_idx % 8) as f64;
+                let mut wf = nsview_frame(window);
+                wf.origin.x += step * 28.0;
+                wf.origin.y = (wf.origin.y - step * 24.0).max(48.0);
+                msg1_point_void(window, sel(c"setFrameOrigin:"), wf.origin);
+            }
+            let _ = configure_host_content_view(window);
         }
         window
     }
@@ -192,6 +363,7 @@ mod platform {
     struct OpenEditor {
         key: SlotKey,
         window: *mut c_void,
+        last_size: (i32, i32),
         backend: NativeBackend,
     }
 
@@ -208,6 +380,25 @@ mod platform {
             self.open.iter().any(|e| e.key == SlotKey { strip, slot })
         }
 
+        pub fn focus_slot(&mut self, strip: usize, slot: usize) {
+            let key = SlotKey { strip, slot };
+            if let Some(ed) = self.open.iter().find(|e| e.key == key) {
+                if !ed.window.is_null() {
+                    unsafe {
+                        with_macos_ui_guard(|| {
+                            let _ = msg1_ptr(
+                                ed.window,
+                                sel(c"makeKeyAndOrderFront:"),
+                                std::ptr::null_mut(),
+                            );
+                            msg0_void(ed.window, sel(c"displayIfNeeded"));
+                            flush_ca_transaction();
+                        });
+                    }
+                }
+            }
+        }
+
         pub fn open_editor(
             &mut self,
             strip: usize,
@@ -216,25 +407,28 @@ mod platform {
         ) -> Result<(), String> {
             self.close_slot(strip, slot);
             let key = SlotKey { strip, slot };
-            match handle {
-                NativePluginHandle::AudioUnit { unit_ptr, title } => {
-                    let editor = unsafe { open_au_editor(key, *unit_ptr, title)? };
-                    self.open.push(editor);
-                    Ok(())
-                }
-                NativePluginHandle::Vst3 {
-                    controller_ptr,
-                    title,
-                } => {
-                    let editor = unsafe { open_vst3_editor(key, *controller_ptr, title)? };
-                    self.open.push(editor);
-                    Ok(())
-                }
-                NativePluginHandle::Vst2 { effect_ptr, title } => {
-                    let editor = unsafe { open_vst2_editor(key, *effect_ptr, title)? };
-                    self.open.push(editor);
-                    Ok(())
-                }
+            let cascade_idx = self.open.len();
+            unsafe {
+                with_macos_ui_guard(|| match handle {
+                    NativePluginHandle::AudioUnit { unit_ptr, title } => {
+                        let editor = open_au_editor(key, *unit_ptr, title, cascade_idx)?;
+                        self.open.push(editor);
+                        Ok(())
+                    }
+                    NativePluginHandle::Vst3 {
+                        controller_ptr,
+                        title,
+                    } => {
+                        let editor = open_vst3_editor(key, *controller_ptr, title, cascade_idx)?;
+                        self.open.push(editor);
+                        Ok(())
+                    }
+                    NativePluginHandle::Vst2 { effect_ptr, title } => {
+                        let editor = open_vst2_editor(key, *effect_ptr, title, cascade_idx)?;
+                        self.open.push(editor);
+                        Ok(())
+                    }
+                })
             }
         }
 
@@ -242,64 +436,158 @@ mod platform {
             let key = SlotKey { strip, slot };
             if let Some(idx) = self.open.iter().position(|e| e.key == key) {
                 let ed = self.open.remove(idx);
-                unsafe { destroy_editor(ed) };
+                unsafe {
+                    with_macos_ui_guard(|| destroy_editor(ed));
+                }
             }
         }
 
         pub fn close_all(&mut self) {
             for ed in self.open.drain(..) {
-                unsafe { destroy_editor(ed) };
+                unsafe {
+                    with_macos_ui_guard(|| destroy_editor(ed));
+                }
             }
         }
 
         pub fn pump_events(&mut self) {
+            if self.open.is_empty() {
+                return;
+            }
             let mut to_close = Vec::new();
-            for ed in &self.open {
-                unsafe {
-                    if ed.window.is_null() || msg0_u8(ed.window, sel(c"isVisible")) == 0 {
-                        to_close.push(ed.key);
-                        continue;
-                    }
-                    match &ed.backend {
-                        NativeBackend::Vst3 { frame_state, .. } => {
-                            let resize = frame_state
-                                .lock()
-                                .ok()
-                                .and_then(|mut st| st.pending_resize.take());
-                            if let Some((w, h)) = resize {
-                                msg1_size_void(
-                                    ed.window,
-                                    sel(c"setContentSize:"),
-                                    NSSize {
-                                        width: f64::from(w.max(100)),
-                                        height: f64::from(h.max(100)),
-                                    },
+            let now = Instant::now();
+            unsafe {
+                with_macos_ui_guard(|| {
+                    for ed in &mut self.open {
+                        if ed.window.is_null() || msg0_u8(ed.window, sel(c"isVisible")) == 0 {
+                            to_close.push(ed.key);
+                            continue;
+                        }
+
+                        let content_view = msg0(ed.window, sel(c"contentView"));
+                        let cur_bounds = if !content_view.is_null() {
+                            let b = nsview_bounds(content_view);
+                            (
+                                (b.size.width.round() as i32).max(100),
+                                (b.size.height.round() as i32).max(100),
+                            )
+                        } else {
+                            ed.last_size
+                        };
+
+                        match &ed.backend {
+                            NativeBackend::Vst3 {
+                                view, frame_state, ..
+                            } => {
+                                let (resize, due_timers) = if let Ok(mut st) = frame_state.lock() {
+                                    let resize = st.pending_resize.take();
+                                    let mut due_timers = Vec::new();
+                                    for t in &mut st.timers {
+                                        if now.duration_since(t.last_fired)
+                                            >= Duration::from_millis(t.interval_ms)
+                                        {
+                                            t.last_fired = now;
+                                            due_timers.push(t.handler);
+                                        }
+                                    }
+                                    (resize, due_timers)
+                                } else {
+                                    (None, Vec::new())
+                                };
+
+                                for timer_handler in due_timers {
+                                    if !timer_handler.is_null() {
+                                        ((*(*timer_handler).vtbl).on_timer)(
+                                            timer_handler as *mut c_void,
+                                        );
+                                    }
+                                }
+
+                                if let Some((w, h)) = resize {
+                                    let nw = w.max(100);
+                                    let nh = h.max(100);
+                                    msg1_size_void(
+                                        ed.window,
+                                        sel(c"setContentSize:"),
+                                        NSSize {
+                                            width: f64::from(nw),
+                                            height: f64::from(nh),
+                                        },
+                                    );
+                                    let pv = *view;
+                                    if !pv.is_null() {
+                                        let mut vr = ViewRect {
+                                            left: 0,
+                                            top: 0,
+                                            right: nw,
+                                            bottom: nh,
+                                        };
+                                        let _ = ((*(*pv).vtbl).on_size)(
+                                            pv as *mut c_void,
+                                            &mut vr,
+                                        );
+                                    }
+                                    ed.last_size = (nw, nh);
+                                    sync_content_view_subviews(ed.window, true);
+                                    flush_ca_transaction();
+                                } else if cur_bounds != ed.last_size {
+                                    ed.last_size = cur_bounds;
+                                    let pv = *view;
+                                    if !pv.is_null() {
+                                        let mut vr = ViewRect {
+                                            left: 0,
+                                            top: 0,
+                                            right: cur_bounds.0,
+                                            bottom: cur_bounds.1,
+                                        };
+                                        let _ = ((*(*pv).vtbl).on_size)(
+                                            pv as *mut c_void,
+                                            &mut vr,
+                                        );
+                                    }
+                                    sync_content_view_subviews(ed.window, true);
+                                    flush_ca_transaction();
+                                }
+                            }
+                            NativeBackend::Vst2 { effect_ptr } => {
+                                vst2_dispatcher(
+                                    *effect_ptr,
+                                    VST2_EFF_EDIT_IDLE,
+                                    0,
+                                    0,
+                                    std::ptr::null_mut(),
+                                    0.0,
                                 );
+                                if let Some((w, h)) = vst2_take_pending_resize(*effect_ptr) {
+                                    let nw = w.max(100);
+                                    let nh = h.max(100);
+                                    msg1_size_void(
+                                        ed.window,
+                                        sel(c"setContentSize:"),
+                                        NSSize {
+                                            width: f64::from(nw),
+                                            height: f64::from(nh),
+                                        },
+                                    );
+                                    ed.last_size = (nw, nh);
+                                    sync_content_view_subviews(ed.window, true);
+                                    flush_ca_transaction();
+                                } else if cur_bounds != ed.last_size {
+                                    ed.last_size = cur_bounds;
+                                    sync_content_view_subviews(ed.window, true);
+                                    flush_ca_transaction();
+                                }
+                            }
+                            NativeBackend::AudioUnit { .. } => {
+                                if cur_bounds != ed.last_size {
+                                    ed.last_size = cur_bounds;
+                                    sync_content_view_subviews(ed.window, true);
+                                    flush_ca_transaction();
+                                }
                             }
                         }
-                        NativeBackend::Vst2 { effect_ptr } => {
-                            vst2_dispatcher(
-                                *effect_ptr,
-                                VST2_EFF_EDIT_IDLE,
-                                0,
-                                0,
-                                std::ptr::null_mut(),
-                                0.0,
-                            );
-                            if let Some((w, h)) = vst2_take_pending_resize(*effect_ptr) {
-                                msg1_size_void(
-                                    ed.window,
-                                    sel(c"setContentSize:"),
-                                    NSSize {
-                                        width: f64::from(w.max(100)),
-                                        height: f64::from(h.max(100)),
-                                    },
-                                );
-                            }
-                        }
-                        NativeBackend::AudioUnit { .. } => {}
                     }
-                }
+                });
             }
             for key in to_close {
                 self.close_slot(key.strip, key.slot);
@@ -332,6 +620,7 @@ mod platform {
     }
 
     unsafe fn destroy_editor(ed: OpenEditor) {
+        let mut au_factory_to_release: *mut c_void = std::ptr::null_mut();
         match ed.backend {
             NativeBackend::Vst3 {
                 view,
@@ -361,23 +650,27 @@ mod platform {
                 );
             }
             NativeBackend::AudioUnit { au_factory } => {
-                if !au_factory.is_null() {
-                    msg0_void(au_factory, sel(c"release"));
-                }
+                au_factory_to_release = au_factory;
             }
         }
         if !ed.window.is_null() {
+            let content_view = msg0(ed.window, sel(c"contentView"));
+            detach_all_subviews(content_view);
             let _ = msg1_ptr(ed.window, sel(c"orderOut:"), std::ptr::null_mut());
-            let _ = msg1_ptr(ed.window, sel(c"setContentView:"), std::ptr::null_mut());
             msg0_void(ed.window, sel(c"close"));
             msg0_void(ed.window, sel(c"release"));
         }
+        if !au_factory_to_release.is_null() {
+            msg0_void(au_factory_to_release, sel(c"release"));
+        }
+        flush_ca_transaction();
     }
 
     unsafe fn open_au_editor(
         key: SlotKey,
         unit_ptr: usize,
         title: &str,
+        cascade_idx: usize,
     ) -> Result<OpenEditor, String> {
         use coreaudio_sys::*;
         const K_AUDIO_UNIT_PROPERTY_COCOA_UI: UInt32 = 14;
@@ -422,7 +715,8 @@ mod platform {
                     let bundle = msg1_ptr(alloc_b, sel(c"initWithURL:"), bundle_url as *mut c_void);
                     if !bundle.is_null() {
                         let _ = msg0_u8(bundle, sel(c"load"));
-                        let mut view_cls = msg1_ptr(bundle, sel(c"classNamed:"), class_name as *mut c_void);
+                        let mut view_cls =
+                            msg1_ptr(bundle, sel(c"classNamed:"), class_name as *mut c_void);
                         if view_cls.is_null() {
                             view_cls = NSClassFromString(class_name);
                         }
@@ -491,13 +785,22 @@ mod platform {
         }
 
         let frame = nsview_frame(view);
-        let width = if frame.size.width > 10.0 { frame.size.width } else { 720.0 };
-        let height = if frame.size.height > 10.0 { frame.size.height } else { 460.0 };
+        let width = if frame.size.width > 10.0 {
+            frame.size.width
+        } else {
+            720.0
+        };
+        let height = if frame.size.height > 10.0 {
+            frame.size.height
+        } else {
+            460.0
+        };
         let window = create_nswindow(
             width,
             height,
             &format!("{title} — AU (Tranche {} Insert {})", key.strip + 1, key.slot + 1),
             true,
+            cascade_idx,
         );
         if window.is_null() {
             if owned_view {
@@ -509,15 +812,26 @@ mod platform {
             return Err("Échec création NSWindow pour l'AudioUnit.".into());
         }
 
-        let _ = msg1_ptr(window, sel(c"setContentView:"), view);
+        let content_view = configure_host_content_view(window);
+        if !content_view.is_null() {
+            let bounds = nsview_bounds(content_view);
+            msg1_usize_void(view, sel(c"setAutoresizingMask:"), 18);
+            msg1_rect_void(view, sel(c"setFrame:"), bounds);
+            let _ = msg1_ptr(content_view, sel(c"addSubview:"), view);
+        } else {
+            let _ = msg1_ptr(window, sel(c"setContentView:"), view);
+        }
         if owned_view {
             msg0_void(view, sel(c"release"));
         }
+        sync_content_view_subviews(window, true);
         let _ = msg1_ptr(window, sel(c"makeKeyAndOrderFront:"), std::ptr::null_mut());
+        flush_ca_transaction();
 
         Ok(OpenEditor {
             key,
             window,
+            last_size: (width.round() as i32, height.round() as i32),
             backend: NativeBackend::AudioUnit { au_factory },
         })
     }
@@ -526,6 +840,7 @@ mod platform {
         key: SlotKey,
         controller_ptr: usize,
         title: &str,
+        cascade_idx: usize,
     ) -> Result<OpenEditor, String> {
         let ctrl = controller_ptr as *mut ComObj<IEditControllerVtbl>;
         if ctrl.is_null() {
@@ -560,6 +875,7 @@ mod platform {
             f64::from(rect.height()),
             &format!("{title} — VST3 (Tranche {} Insert {})", key.strip + 1, key.slot + 1),
             resizable,
+            cascade_idx,
         );
         if window.is_null() {
             let _ = ((*(*view).vtbl).set_frame)(view as *mut c_void, std::ptr::null_mut());
@@ -568,13 +884,14 @@ mod platform {
             return Err("Échec création NSWindow pour le VST3.".into());
         }
 
-        let content_view = msg0(window, sel(c"contentView"));
+        let content_view = configure_host_content_view(window);
         if ((*(*view).vtbl).attached)(view as *mut c_void, content_view, platform_type)
             != K_RESULT_OK
         {
             let _ = ((*(*view).vtbl).set_frame)(view as *mut c_void, std::ptr::null_mut());
             let _ = ((*(*view).vtbl).base.release)(view as *mut c_void);
             let _ = ((*(*frame).vtbl).base.release)(frame as *mut c_void);
+            detach_all_subviews(content_view);
             msg0_void(window, sel(c"close"));
             msg0_void(window, sel(c"release"));
             return Err("IPlugView::attached(NSView) a échoué sur ce VST3.".into());
@@ -597,11 +914,14 @@ mod platform {
 
         let _ = ((*(*view).vtbl).on_size)(view as *mut c_void, &mut rect);
         let _ = ((*(*view).vtbl).on_focus)(view as *mut c_void, 1);
+        sync_content_view_subviews(window, true);
         let _ = msg1_ptr(window, sel(c"makeKeyAndOrderFront:"), std::ptr::null_mut());
+        flush_ca_transaction();
 
         Ok(OpenEditor {
             key,
             window,
+            last_size: (rect.width(), rect.height()),
             backend: NativeBackend::Vst3 {
                 view,
                 frame,
@@ -614,6 +934,7 @@ mod platform {
         key: SlotKey,
         effect_ptr: usize,
         title: &str,
+        cascade_idx: usize,
     ) -> Result<OpenEditor, String> {
         let mut rect_ptr: *mut Vst2Rect = std::ptr::null_mut();
         vst2_dispatcher(
@@ -638,12 +959,13 @@ mod platform {
             init_h,
             &format!("{title} — VST2 (Tranche {} Insert {})", key.strip + 1, key.slot + 1),
             true,
+            cascade_idx,
         );
         if window.is_null() {
             return Err("Échec création NSWindow pour le VST2.".into());
         }
 
-        let content_view = msg0(window, sel(c"contentView"));
+        let content_view = configure_host_content_view(window);
         vst2_dispatcher(effect_ptr, VST2_EFF_EDIT_OPEN, 0, 0, content_view, 0.0);
 
         let mut final_w = init_w;
@@ -672,14 +994,17 @@ mod platform {
             }
         }
 
+        let nw = final_w.max(200.0);
+        let nh = final_h.max(150.0);
         msg1_size_void(
             window,
             sel(c"setContentSize:"),
             NSSize {
-                width: final_w.max(200.0),
-                height: final_h.max(150.0),
+                width: nw,
+                height: nh,
             },
         );
+        sync_content_view_subviews(window, true);
         let _ = msg1_ptr(window, sel(c"makeKeyAndOrderFront:"), std::ptr::null_mut());
         vst2_dispatcher(
             effect_ptr,
@@ -689,10 +1014,12 @@ mod platform {
             std::ptr::null_mut(),
             0.0,
         );
+        flush_ca_transaction();
 
         Ok(OpenEditor {
             key,
             window,
+            last_size: (nw.round() as i32, nh.round() as i32),
             backend: NativeBackend::Vst2 { effect_ptr },
         })
     }
@@ -784,6 +1111,7 @@ mod platform {
         set_wm_protocols: unsafe extern "C" fn(*mut c_void, c_ulong, *mut c_ulong, c_int) -> c_int,
         select_input: unsafe extern "C" fn(*mut c_void, c_ulong, c_long) -> c_int,
         map_window: unsafe extern "C" fn(*mut c_void, c_ulong) -> c_int,
+        map_raised: unsafe extern "C" fn(*mut c_void, c_ulong) -> c_int,
         resize_window: unsafe extern "C" fn(*mut c_void, c_ulong, c_uint, c_uint) -> c_int,
         pending: unsafe extern "C" fn(*mut c_void) -> c_int,
         next_event: unsafe extern "C" fn(*mut c_void, *mut XEvent) -> c_int,
@@ -823,6 +1151,7 @@ mod platform {
                 set_wm_protocols: sym!(c"XSetWMProtocols"),
                 select_input: sym!(c"XSelectInput"),
                 map_window: sym!(c"XMapWindow"),
+                map_raised: sym!(c"XMapRaised"),
                 resize_window: sym!(c"XResizeWindow"),
                 pending: sym!(c"XPending"),
                 next_event: sym!(c"XNextEvent"),
@@ -898,6 +1227,21 @@ mod platform {
 
         pub fn is_open(&self, strip: usize, slot: usize) -> bool {
             self.open.iter().any(|e| e.key == SlotKey { strip, slot })
+        }
+
+        pub fn focus_slot(&mut self, strip: usize, slot: usize) {
+            let key = SlotKey { strip, slot };
+            if let (Some(x11), Some(ed)) = (
+                self.x11.as_ref(),
+                self.open.iter().find(|e| e.key == key),
+            ) {
+                if !self.display.is_null() && ed.window != 0 {
+                    unsafe {
+                        (x11.map_raised)(self.display, ed.window);
+                        (x11.flush)(self.display);
+                    }
+                }
+            }
         }
 
         pub fn open_editor(

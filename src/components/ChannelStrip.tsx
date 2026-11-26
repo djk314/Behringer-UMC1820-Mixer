@@ -1,5 +1,5 @@
 import React from 'react';
-import { Power, Plus, Split, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Power, Plus, Split, X } from 'lucide-react';
 import {
   AuxPairStereoState,
   AuxSendsTuple,
@@ -28,6 +28,9 @@ interface ChannelStripProps {
   auxPairStereo: AuxPairStereoState;
   hardwareChannels?: { in: number; out: number };
   midiPorts?: MidiPortInfo[];
+  canMoveLeft?: boolean;
+  canMoveRight?: boolean;
+  onMoveStrip?: (stripId: string, delta: -1 | 1) => void;
   onToggleInputPair?: (pairIndex: number) => void;
   onToggleAuxPair?: (pairIndex: number) => void;
   onUpdate: (stripId: string, updater: (prev: StripState) => StripState) => void;
@@ -79,6 +82,9 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
   auxPairStereo,
   hardwareChannels = { in: 8, out: 10 },
   midiPorts = [],
+  canMoveLeft = false,
+  canMoveRight = false,
+  onMoveStrip,
   onToggleInputPair,
   onToggleAuxPair,
   onUpdate,
@@ -95,10 +101,10 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
   const isAuxStereo = isAux && auxPairIndex >= 0 && auxPairStereo[auxPairIndex];
 
   const stripBg = isMaster
-    ? 'bg-[#19161D] border-amber-500/30'
+    ? 'bg-[var(--bg-strip-master)] border-amber-500/35'
     : isAux
-      ? 'bg-[#121924] border-sky-500/25'
-      : 'bg-[#131720] border-[#232936]';
+      ? 'bg-[var(--bg-strip-aux)] border-sky-500/30'
+      : 'bg-[var(--bg-strip-in)] border-[var(--border-main)]';
 
   const activeInsertCount = strip.inserts.filter((s) => s.plugin !== null).length;
 
@@ -126,8 +132,20 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
       }`}
     >
       {/* Strip Header */}
-      <div className="flex flex-col gap-0.5 border-b border-[#232936] pb-2">
+      <div className="flex flex-col gap-0.5 border-b border-[var(--border-main)] pb-2">
         <div className="flex items-center justify-between gap-1">
+          {isInput && onMoveStrip && (
+            <button
+              type="button"
+              disabled={!canMoveLeft}
+              onClick={() => onMoveStrip(strip.id, -1)}
+              aria-label={`Déplacer ${strip.name} à gauche`}
+              title="Déplacer la piste vers la gauche"
+              className="p-0.5 rounded border border-[var(--border-main)] bg-[var(--bg-control)] text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-30 disabled:cursor-default cursor-pointer shrink-0"
+            >
+              <ChevronLeft className="w-3 h-3" />
+            </button>
+          )}
           <input
             type="text"
             value={strip.name}
@@ -136,10 +154,22 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
             onChange={(e) =>
               onUpdate(strip.id, (s) => ({ ...s, name: e.target.value }))
             }
-            className="w-full bg-transparent text-xs font-semibold text-slate-100 focus:outline-none focus:bg-[#1B212E] rounded px-1 -mx-1 truncate"
+            className="w-full min-w-0 bg-transparent text-xs font-semibold text-[var(--text-main)] focus:outline-none focus:bg-[var(--bg-control)] rounded px-1 truncate text-center"
           />
+          {isInput && onMoveStrip && (
+            <button
+              type="button"
+              disabled={!canMoveRight}
+              onClick={() => onMoveStrip(strip.id, 1)}
+              aria-label={`Déplacer ${strip.name} à droite`}
+              title="Déplacer la piste vers la droite"
+              className="p-0.5 rounded border border-[var(--border-main)] bg-[var(--bg-control)] text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-30 disabled:cursor-default cursor-pointer shrink-0"
+            >
+              <ChevronRight className="w-3 h-3" />
+            </button>
+          )}
         </div>
-        <div className="text-[10px] font-mono text-slate-400 truncate">
+        <div className="text-[10px] font-mono text-[var(--text-muted)] truncate text-center">
           {strip.hardwareChannelLabel}
         </div>
       </div>
@@ -158,7 +188,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 hardwareChannelLabel: formatInputRouteLabel(nextRoute),
               }));
             }}
-            className="w-full bg-[#0B0E14] border border-amber-500/30 rounded px-1.5 py-1 text-[10px] text-amber-200 focus:outline-none focus:border-amber-400 truncate"
+            className="w-full bg-[var(--bg-control)] border border-amber-500/35 rounded px-1.5 py-1 text-[10px] text-amber-200 focus:outline-none focus:border-amber-400 truncate"
             title="Sélecteur d'entrée physique (carte son)"
           >
             <option value="none">Entrée : Aucune</option>
@@ -187,7 +217,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 outputRoute: nextRoute,
               }));
             }}
-            className="w-full bg-[#0B0E14] border border-sky-500/30 rounded px-1.5 py-1 text-[10px] text-sky-200 focus:outline-none focus:border-sky-400 truncate"
+            className="w-full bg-[var(--bg-control)] border border-sky-500/35 rounded px-1.5 py-1 text-[10px] text-sky-200 focus:outline-none focus:border-sky-400 truncate"
             title="Sélecteur de sortie (Master ou sortie matérielle directe)"
           >
             <option value="master">Vers Master</option>
@@ -216,7 +246,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 source: e.target.value as InputSourceKind,
               }))
             }
-            className="w-full bg-[#0B0E14] border border-[#232936] rounded px-1.5 py-1 text-[10px] text-slate-300 focus:outline-none focus:border-sky-500 truncate"
+            className="w-full bg-[var(--bg-control)] border border-[var(--border-main)] rounded px-1.5 py-1 text-[10px] text-[var(--text-main)] focus:outline-none focus:border-sky-500 truncate"
             title="Source de test Web Audio"
           >
             {SOURCE_OPTIONS.map((opt) => (
@@ -239,7 +269,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 hardwareChannelLabel: formatOutputRouteLabel(nextRoute),
               }));
             }}
-            className={`w-full bg-[#0B0E14] rounded px-1.5 py-1 text-[10px] focus:outline-none truncate border ${
+            className={`w-full bg-[var(--bg-control)] rounded px-1.5 py-1 text-[10px] focus:outline-none truncate border ${
               isMaster
                 ? 'border-amber-500/35 text-amber-200 focus:border-amber-400'
                 : 'border-sky-500/35 text-sky-200 focus:border-sky-400'
@@ -282,7 +312,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
               <span>{isAuxStereo ? 'Stéréo → Mono' : 'Mono → Stéréo'}</span>
             </button>
           ) : (
-            <div className="h-[24px] flex items-center justify-center text-[10px] font-mono text-amber-300/90 bg-[#0B0E14]/60 border border-[#232936]/70 rounded">
+            <div className="h-[24px] flex items-center justify-center text-[10px] font-mono text-amber-300 bg-[var(--bg-control)] border border-[var(--border-main)] rounded">
               Sortie Principale
             </div>
           )}
@@ -290,7 +320,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
       )}
 
       {/* Gain Rotary Knob & Input Pair Stereo/Mono Split — INPUT STRIPS ONLY */}
-      <div className="flex flex-col items-center justify-center gap-1.5 py-1 border-b border-[#232936]">
+      <div className="flex flex-col items-center justify-center gap-1.5 py-1 border-b border-[var(--border-main)]">
         {isInput ? (
           <>
             <RotaryKnob
@@ -327,14 +357,14 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
             )}
 
             {/* Routage MIDI (Appareil + Canal) — PISTES D'ENTRÉE UNIQUEMENT */}
-            <div className="w-full flex flex-col gap-1 pt-1 border-t border-[#232936]/70">
+            <div className="w-full flex flex-col gap-1 pt-1 border-t border-[var(--border-main)]">
               <select
                 aria-label={`Appareil MIDI ${strip.name}`}
                 value={strip.midiDevice}
                 onChange={(e) =>
                   onUpdate(strip.id, (s) => ({ ...s, midiDevice: e.target.value }))
                 }
-                className="w-full bg-[#0B0E14] border border-emerald-500/30 rounded px-1.5 py-0.5 text-[10px] text-emerald-200 focus:outline-none focus:border-emerald-400 truncate"
+                className="w-full bg-[var(--bg-control)] border border-emerald-500/35 rounded px-1.5 py-0.5 text-[10px] text-emerald-200 focus:outline-none focus:border-emerald-400 truncate"
                 title="Appareil MIDI source pour cette tranche d'entrée"
               >
                 <option value="all">MIDI : Tous</option>
@@ -361,7 +391,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                     midiChannel: val === 'off' ? null : Number(val),
                   }));
                 }}
-                className="w-full bg-[#0B0E14] border border-[#232936] rounded px-1.5 py-0.5 text-[10px] text-slate-300 focus:outline-none focus:border-emerald-400 truncate"
+                className="w-full bg-[var(--bg-control)] border border-[var(--border-main)] rounded px-1.5 py-0.5 text-[10px] text-[var(--text-main)] focus:outline-none focus:border-emerald-400 truncate"
                 title="Canal MIDI reçu par cette tranche d'entrée"
               >
                 <option value="off">Canal MIDI : OFF</option>
@@ -394,8 +424,8 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
       </div>
 
       {/* 5 Insert Plugin Slots (VST2 / VST3 / Apple AU) */}
-      <div className="flex flex-col gap-1 border-b border-[#232936] pb-2">
-        <div className="flex items-center justify-between text-[10px] text-slate-400 px-0.5">
+      <div className="flex flex-col gap-1 border-b border-[var(--border-main)] pb-2">
+        <div className="flex items-center justify-between text-[10px] text-[var(--text-muted)] px-0.5">
           <span className="font-medium">Inserts</span>
           <span className="font-mono tabular-nums">
             {activeInsertCount}/{MAX_INSERTS_PER_STRIP}
@@ -411,9 +441,9 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 className={`flex items-center gap-1 rounded border px-1 py-0.5 text-[10px] transition-colors ${
                   hasPlugin
                     ? slot.bypassed
-                      ? 'bg-[#10141D] border-[#232936] text-slate-500'
-                      : 'bg-[#1A2232] border-sky-500/40 text-slate-100'
-                    : 'bg-[#0B0E14]/70 border-[#1E2430] text-slate-500 hover:border-slate-600'
+                      ? 'bg-[var(--bg-control)] border-[var(--border-main)] text-[var(--text-muted)]'
+                      : 'bg-sky-500/12 border-sky-500/45 text-[var(--text-main)]'
+                    : 'bg-[var(--bg-control)] border-[var(--border-main)] text-[var(--text-muted)] hover:border-slate-500'
                 }`}
               >
                 <button
@@ -500,9 +530,9 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
       </div>
 
       {/* 5-Band Rotary EQ (with 5th Mid 1 kHz knob centered in the middle) */}
-      <div className="flex flex-col gap-1.5 border-b border-[#232936] pb-2">
+      <div className="flex flex-col gap-1.5 border-b border-[var(--border-main)] pb-2">
         <div className="flex items-center justify-between px-0.5">
-          <span className="text-[10px] font-medium text-slate-400">EQ 5 Bandes</span>
+          <span className="text-[10px] font-medium text-[var(--text-muted)]">EQ 5 Bandes</span>
           <button
             type="button"
             onClick={() =>
@@ -513,7 +543,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
             }
             className={`text-[9px] font-mono px-1.5 py-0.5 rounded border cursor-pointer transition-colors ${
               strip.eq.bypassed
-                ? 'bg-[#0B0E14] border-[#232936] text-slate-500'
+                ? 'bg-[var(--bg-control)] border-[var(--border-main)] text-[var(--text-muted)]'
                 : 'bg-sky-500/15 border-sky-500/40 text-sky-300'
             }`}
           >
@@ -609,8 +639,8 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
 
       {/* Dynamic Auxiliary Rotary Sends (4 Stereo or up to 8 Mono) — OMITTED ON MASTER STRIP */}
       {!isMaster ? (
-        <div className="flex flex-col gap-1.5 border-b border-[#232936] pb-2">
-          <span className="text-[10px] font-medium text-slate-400 px-0.5">
+        <div className="flex flex-col gap-1.5 border-b border-[var(--border-main)] pb-2">
+          <span className="text-[10px] font-medium text-[var(--text-muted)] px-0.5">
             Envois Aux ({activeAuxSends.length})
           </span>
           <div className="grid grid-cols-2 gap-y-1.5 gap-x-1 place-items-center">
@@ -638,8 +668,8 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
           </div>
         </div>
       ) : (
-        <div className="flex-1 flex items-center justify-center border-b border-[#232936] py-3 text-center">
-          <span className="text-[10px] font-mono text-slate-500 px-1">
+        <div className="flex-1 flex items-center justify-center border-b border-[var(--border-main)] py-3 text-center">
+          <span className="text-[10px] font-mono text-[var(--text-muted)] px-1">
             Sortie Sommation Principale
           </span>
         </div>
@@ -657,7 +687,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
             className={`flex-1 py-1.5 rounded text-[11px] font-bold tracking-wide border transition-colors cursor-pointer whitespace-nowrap ${
               strip.solo
                 ? 'bg-amber-400 text-slate-950 border-amber-300'
-                : 'bg-[#1A202C] text-slate-300 border-[#2D3545] hover:border-amber-500/50'
+                : 'bg-[var(--bg-control-alt)] text-[var(--text-main)] border-[var(--border-strong)] hover:border-amber-500/50'
             }`}
           >
             SOLO
@@ -672,7 +702,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
           className={`flex-1 py-1.5 rounded text-[11px] font-bold tracking-wide border transition-colors cursor-pointer whitespace-nowrap ${
             strip.mute
               ? 'bg-red-500 text-white border-red-400'
-              : 'bg-[#1A202C] text-slate-300 border-[#2D3545] hover:border-red-500/50'
+              : 'bg-[var(--bg-control-alt)] text-[var(--text-main)] border-[var(--border-strong)] hover:border-red-500/50'
           }`}
         >
           MUTE
@@ -693,7 +723,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
       </div>
 
       {/* Fader Value Readout */}
-      <div className="text-center font-mono tabular-nums text-[11px] text-slate-200 bg-[#0B0E14] border border-[#232936] rounded py-0.5">
+      <div className="text-center font-mono tabular-nums text-[11px] text-[var(--text-main)] bg-[var(--bg-control)] border border-[var(--border-main)] rounded py-0.5">
         {strip.volumeDb <= -59.5
           ? '-∞ dB'
           : `${strip.volumeDb > 0 ? '+' : ''}${strip.volumeDb.toFixed(1)} dB`}

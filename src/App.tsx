@@ -41,6 +41,7 @@ import {
   PlayerStatus,
   PluginDescriptor,
   StripState,
+  UiThemeId,
   formatInputRouteLabel,
   formatOutputRouteLabel,
 } from './types/mixer';
@@ -55,6 +56,33 @@ type HardwareProfileId = 'umc1820' | 'stereo_2x2' | 'quad_4x4' | 'studio_16x16';
 const BUFFER_LATENCY_PRESETS: AudioBufferLatencyPreset[] = [64, 128, 256, 512, 1024, 2048];
 const DEFAULT_INPUT_PAIRS: InputPairStereoState = [true, true, true, true, true, true, true, true];
 const DEFAULT_AUX_PAIRS: AuxPairStereoState = [true, true, true, true];
+const DEFAULT_INPUT_ORDER: number[] = Array.from({ length: NUM_INPUT_STRIPS }, (_, i) => i);
+
+const UI_THEMES: { id: UiThemeId; label: string; swatch: string; isLight: boolean }[] = [
+  { id: 'noir_studio', label: '1. Noir Studio (Très sombre)', swatch: '#05070B', isLight: false },
+  { id: 'nuit_console', label: '2. Nuit Console (Sombre)', swatch: '#0B0E14', isLight: false },
+  { id: 'ardoise', label: '3. Ardoise (Moyen)', swatch: '#1E2430', isLight: false },
+  { id: 'titane', label: '4. Titane (Clair)', swatch: '#D6DCE6', isLight: true },
+  { id: 'lumiere_jour', label: '5. Lumière Jour (Très clair)', swatch: '#F4F6FA', isLight: true },
+];
+
+function normalizeInputOrder(raw: unknown): number[] {
+  const seen = new Set<number>();
+  const out: number[] = [];
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      const n = Number(item);
+      if (Number.isInteger(n) && n >= 0 && n < NUM_INPUT_STRIPS && !seen.has(n)) {
+        seen.add(n);
+        out.push(n);
+      }
+    }
+  }
+  for (let i = 0; i < NUM_INPUT_STRIPS; i++) {
+    if (!seen.has(i)) out.push(i);
+  }
+  return out;
+}
 
 const HARDWARE_PROFILES: Record<
   HardwareProfileId,
@@ -237,6 +265,7 @@ function normalizeLoadedSnapshot(raw: unknown): {
   strips: StripState[];
   inputPairStereo: InputPairStereoState;
   auxPairStereo: AuxPairStereoState;
+  inputOrder: number[];
   bufferFrames?: AudioBufferLatencyPreset;
   playerLoop?: boolean;
   playerGain?: number;
@@ -373,6 +402,7 @@ function normalizeLoadedSnapshot(raw: unknown): {
     strips: base.map((b) => baseById.get(b.id) ?? b),
     inputPairStereo,
     auxPairStereo,
+    inputOrder: normalizeInputOrder(obj.inputOrder),
     bufferFrames: validBuf,
     playerLoop: typeof obj.playerLoop === 'boolean' ? obj.playerLoop : undefined,
     playerGain: typeof obj.playerGain === 'number' ? obj.playerGain : undefined,
@@ -430,21 +460,25 @@ export default function App() {
   const consoleViewportRef = useRef<HTMLDivElement | null>(null);
   const [stripView, setStripView] = useState<StripViewFilter>('all');
   const [inputBank, setInputBank] = useState<InputBankFilter>('all');
+  const [theme, setTheme] = useState<UiThemeId>('nuit_console');
+  const [inputOrder, setInputOrder] = useState<number[]>(() => [...DEFAULT_INPUT_ORDER]);
 
   // Set Save / Load feedback
   const [setNotice, setSetNotice] = useState<string | null>(null);
   const setFileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Audio File Player (MP3 / WAV) state
+  // Audio File Player (MP3 / WAV) state — closed by default
   const audioFileInputRef = useRef<HTMLInputElement | null>(null);
   const [playerStatus, setPlayerStatus] = useState<PlayerStatus>(EMPTY_PLAYER_STATUS);
   const [playerLoop, setPlayerLoop] = useState(false);
   const [playerGain, setPlayerGain] = useState(1.0);
   const [playerTargetStripId, setPlayerTargetStripId] = useState<string | null>(null);
-  const [showPlayerBar, setShowPlayerBar] = useState(true);
+  const [showPlayerBar, setShowPlayerBar] = useState(false);
 
   // Top Workspace Dropdown Menus
-  const [openMenu, setOpenMenu] = useState<'fichier' | 'audio' | 'midi' | 'affichage' | null>(null);
+  const [openMenu, setOpenMenu] = useState<
+    'fichier' | 'audio' | 'midi' | 'affichage' | 'apropos' | null
+  >(null);
   const menuBarRef = useRef<HTMLDivElement | null>(null);
 
   // Web MIDI + Remote MIDI state
@@ -532,11 +566,14 @@ export default function App() {
             ) {
               setBufferFrames(msg.buffer_frames as AudioBufferLatencyPreset);
             }
-              if (Array.isArray(msg.midi_ports)) {
-                setRemoteMidiPortNames(
-                  msg.midi_ports.filter((p: unknown): p is string => typeof p === 'string')
-                );
-              }
+            if (Array.isArray(msg.input_order) && msg.input_order.length === NUM_INPUT_STRIPS) {
+              setInputOrder(normalizeInputOrder(msg.input_order));
+            }
+            if (Array.isArray(msg.midi_ports)) {
+              setRemoteMidiPortNames(
+                msg.midi_ports.filter((p: unknown): p is string => typeof p === 'string')
+              );
+            }
               setStrips((prev) =>
               prev.map((localStrip, idx) => {
                 const remote = msg.strips[idx];
@@ -708,6 +745,14 @@ export default function App() {
     void refreshMidiPorts();
   }, [refreshMidiPorts]);
 
+  // Sync active studio theme to root dataset and dark class
+  useEffect(() => {
+    const root = document.documentElement;
+    root.dataset.theme = theme;
+    const themeMeta = UI_THEMES.find((t) => t.id === theme);
+    root.classList.toggle('dark', !themeMeta?.isLight);
+  }, [theme]);
+
   // Close open top menu on outside click or Escape key
   useEffect(() => {
     if (!openMenu) return;
@@ -786,6 +831,9 @@ export default function App() {
         const next = updater(s);
         if (wsRef.current?.readyState === WebSocket.OPEN) {
           const idx = next.index;
+          if (next.name !== s.name) {
+            sendRemoteCmd({ type: 'set_strip_name', strip: idx, name: next.name });
+          }
           if (next.volumeDb !== s.volumeDb) {
             sendRemoteCmd({ type: 'set_volume', strip: idx, volume_db: next.volumeDb });
           }
@@ -988,6 +1036,30 @@ export default function App() {
     setInputBank((prev) => (prev === 'all' ? 'b1' : prev === 'b1' ? 'b2' : 'all'));
   };
 
+  const handleMoveInputStrip = (stripId: string, delta: -1 | 1) => {
+    const targetStrip = strips.find((s) => s.id === stripId && s.kind === 'input');
+    if (!targetStrip) return;
+    const stripIdx = targetStrip.index;
+    const visibleOrder = inputOrder.filter((idx) => {
+      const pairIdx = Math.floor(idx / 2);
+      return !(inputPairStereo[pairIdx] && idx % 2 === 1);
+    });
+    const visPos = visibleOrder.indexOf(stripIdx);
+    const targetVisPos = visPos + delta;
+    if (visPos < 0 || targetVisPos < 0 || targetVisPos >= visibleOrder.length) return;
+    const otherIdx = visibleOrder[targetVisPos];
+    setInputOrder((prev) => {
+      const next = [...prev];
+      const posA = next.indexOf(stripIdx);
+      const posB = next.indexOf(otherIdx);
+      if (posA >= 0 && posB >= 0) {
+        [next[posA], next[posB]] = [next[posB], next[posA]];
+      }
+      return next;
+    });
+    sendRemoteCmd({ type: 'move_input_strip', strip: stripIdx, delta });
+  };
+
   const handleBufferSizeChange = async (nextFrames: AudioBufferLatencyPreset) => {
     setBufferFrames(nextFrames);
     if (engineRef.current && engineRunning) {
@@ -1104,9 +1176,10 @@ export default function App() {
 
   const handleSaveSet = () => {
     const snapshot: MixerSetSnapshot = {
-      version: 3,
+      version: 4,
       inputPairStereo,
       auxPairStereo,
+      inputOrder,
       bufferFrames,
       strips,
       playerLoop,
@@ -1141,6 +1214,7 @@ export default function App() {
       setStrips(normalized.strips);
       setInputPairStereo(normalized.inputPairStereo);
       setAuxPairStereo(normalized.auxPairStereo);
+      setInputOrder(normalized.inputOrder);
       if (normalized.bufferFrames !== undefined) {
         setBufferFrames(normalized.bufferFrames);
         if (engineRef.current && engineRunning) {
@@ -1185,6 +1259,7 @@ export default function App() {
       setSampleRate(engineRef.current.getSampleRate());
       setEngineRunning(true);
       setPlayerStatus(status);
+      setShowPlayerBar(true);
       showTemporaryNotice(`Piste chargée : ${file.name}`);
     } catch {
       showTemporaryNotice('Impossible de décoder le fichier audio');
@@ -1275,18 +1350,19 @@ export default function App() {
 
   const activeInputStrips = useMemo(() => {
     const visible: StripState[] = [];
-    for (let p = 0; p < MAX_INPUT_PAIRS; p++) {
-      const primary = inputStrips[p * 2];
-      const secondary = inputStrips[p * 2 + 1];
-      if (primary) visible.push(primary);
-      if (!inputPairStereo[p] && secondary) visible.push(secondary);
+    for (const idx of inputOrder) {
+      const strip = inputStrips[idx];
+      if (!strip) continue;
+      const pairIdx = Math.floor(idx / 2);
+      if (inputPairStereo[pairIdx] && idx % 2 === 1) continue;
+      visible.push(strip);
     }
     return visible;
-  }, [inputStrips, inputPairStereo]);
+  }, [inputStrips, inputPairStereo, inputOrder]);
 
   const visibleInputStrips = useMemo(() => {
-    if (inputBank === 'b1') return activeInputStrips.filter((s) => s.index < 8);
-    if (inputBank === 'b2') return activeInputStrips.filter((s) => s.index >= 8);
+    if (inputBank === 'b1') return activeInputStrips.slice(0, 8);
+    if (inputBank === 'b2') return activeInputStrips.slice(8);
     return activeInputStrips;
   }, [activeInputStrips, inputBank]);
 
@@ -1377,7 +1453,7 @@ export default function App() {
   const bufferLatencyMs = ((bufferFrames / Math.max(1, sampleRate)) * 1000).toFixed(1);
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#0B0E14] text-slate-100">
+    <div className="min-h-screen flex flex-col bg-[var(--bg-app)] text-[var(--text-main)]">
       {/* Hidden file inputs for Set loading & MP3/WAV loading */}
       <input
         ref={setFileInputRef}
@@ -1395,14 +1471,14 @@ export default function App() {
       />
 
       {/* 3-Zone Top Bar */}
-      <header className="flex items-center justify-between gap-6 px-6 py-3 border-b border-[#232936] bg-[#0E121A] flex-wrap">
+      <header className="flex items-center justify-between gap-6 px-6 py-3 border-b border-[var(--border-main)] bg-[var(--bg-header)] flex-wrap">
         <a
           href="#console"
           onClick={(e) => {
             e.preventDefault();
             setActiveTab('console');
           }}
-          className="text-base font-bold tracking-tight text-slate-100 whitespace-nowrap shrink-0"
+          className="text-base font-bold tracking-tight text-[var(--text-main)] whitespace-nowrap shrink-0"
         >
           UMC1820 Studio Mixer
         </a>
@@ -1413,8 +1489,8 @@ export default function App() {
             onClick={() => setActiveTab('console')}
             className={`whitespace-nowrap shrink-0 cursor-pointer transition-colors pb-0.5 border-b-2 ${
               activeTab === 'console'
-                ? 'text-white border-amber-400'
-                : 'text-slate-400 border-transparent hover:text-slate-200'
+                ? 'text-[var(--text-main)] border-amber-400'
+                : 'text-[var(--text-muted)] border-transparent hover:text-[var(--text-main)]'
             }`}
           >
             Console de mixage
@@ -1474,10 +1550,10 @@ export default function App() {
         </div>
       </header>
 
-      {/* Clean Menu Bar (Fichier, Audio, MIDI, Affichage + essential quick controls) */}
+      {/* Clean Menu Bar (Fichier, Audio, MIDI, Affichage, À propos + essential quick controls) */}
       <div
         ref={menuBarRef}
-        className="relative z-30 flex items-center justify-between gap-4 px-6 py-2 border-b border-[#232936] bg-[#11151E]"
+        className="relative z-30 flex items-center justify-between gap-4 px-6 py-2 border-b border-[var(--border-main)] bg-[var(--bg-menubar)]"
       >
         <div className="flex items-center gap-1.5 flex-wrap">
           {/* Menu Fichier */}
@@ -1488,15 +1564,15 @@ export default function App() {
               onClick={() => setOpenMenu((m) => (m === 'fichier' ? null : 'fichier'))}
               className={`flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded border cursor-pointer whitespace-nowrap transition-colors ${
                 openMenu === 'fichier'
-                  ? 'bg-[#1D2432] text-white border-amber-400/60'
-                  : 'bg-[#171C26] text-slate-200 border-[#283040] hover:border-slate-500'
+                  ? 'bg-[var(--bg-hover)] text-[var(--text-main)] border-amber-400/60'
+                  : 'bg-[var(--bg-control)] text-[var(--text-main)] border-[var(--border-strong)] hover:border-slate-500'
               }`}
             >
               <span>Fichier</span>
-              <ChevronDown className="w-3 h-3 text-slate-400" />
+              <ChevronDown className="w-3 h-3 text-[var(--text-muted)]" />
             </button>
             {openMenu === 'fichier' && (
-              <div className="absolute left-0 top-full mt-1 w-60 rounded-md border border-[#2D3545] bg-[#141923] shadow-xl py-1.5 z-50 text-xs">
+              <div className="absolute left-0 top-full mt-1 w-60 rounded-md border border-[var(--border-strong)] bg-[var(--bg-panel)] shadow-xl py-1.5 z-50 text-xs">
                 <button
                   type="button"
                   onClick={() => {
@@ -1539,6 +1615,7 @@ export default function App() {
                     setStrips(createInitialStrips());
                     setInputPairStereo([...DEFAULT_INPUT_PAIRS] as InputPairStereoState);
                     setAuxPairStereo([...DEFAULT_AUX_PAIRS] as AuxPairStereoState);
+                    setInputOrder([...DEFAULT_INPUT_ORDER]);
                     setInputBank('all');
                     setFrameBoxSize({ width: null, height: null });
                     showTemporaryNotice('Console réinitialisée');
@@ -1795,16 +1872,41 @@ export default function App() {
               onClick={() => setOpenMenu((m) => (m === 'affichage' ? null : 'affichage'))}
               className={`flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded border cursor-pointer whitespace-nowrap transition-colors ${
                 openMenu === 'affichage'
-                  ? 'bg-[#1D2432] text-white border-amber-400/60'
-                  : 'bg-[#171C26] text-slate-200 border-[#283040] hover:border-slate-500'
+                  ? 'bg-[var(--bg-hover)] text-[var(--text-main)] border-amber-400/60'
+                  : 'bg-[var(--bg-control)] text-[var(--text-main)] border-[var(--border-strong)] hover:border-slate-500'
               }`}
             >
               <span>Affichage</span>
-              <ChevronDown className="w-3 h-3 text-slate-400" />
+              <ChevronDown className="w-3 h-3 text-[var(--text-muted)]" />
             </button>
             {openMenu === 'affichage' && (
-              <div className="absolute left-0 top-full mt-1 w-64 rounded-md border border-[#2D3545] bg-[#141923] shadow-xl py-1.5 z-50 text-xs max-h-[75vh] overflow-y-auto">
-                <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+              <div className="absolute left-0 top-full mt-1 w-68 rounded-md border border-[var(--border-strong)] bg-[var(--bg-panel)] shadow-xl py-1.5 z-50 text-xs max-h-[75vh] overflow-y-auto">
+                <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                  Thème (sombre → clair)
+                </div>
+                {UI_THEMES.map((t) => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    onClick={() => {
+                      setTheme(t.id);
+                      setOpenMenu(null);
+                    }}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-left text-[var(--text-main)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                  >
+                    <span className="flex items-center gap-2">
+                      <span
+                        className="w-3 h-3 rounded-sm border border-slate-500/60 shrink-0"
+                        style={{ backgroundColor: t.swatch }}
+                        aria-hidden="true"
+                      />
+                      <span>{t.label}</span>
+                    </span>
+                    {theme === t.id && <Check className="w-3.5 h-3.5 text-amber-400 shrink-0" />}
+                  </button>
+                ))}
+                <div className="my-1 border-t border-[var(--border-main)]" />
+                <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
                   Vue des tranches
                 </div>
                 {(
@@ -1821,14 +1923,14 @@ export default function App() {
                       setStripView(val);
                       setOpenMenu(null);
                     }}
-                    className="w-full flex items-center justify-between px-3 py-1.5 text-left text-slate-200 hover:bg-[#1E2636] cursor-pointer"
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-left text-[var(--text-main)] hover:bg-[var(--bg-hover)] cursor-pointer"
                   >
                     <span>{label}</span>
                     {stripView === val && <Check className="w-3.5 h-3.5 text-amber-400" />}
                   </button>
                 ))}
-                <div className="my-1 border-t border-[#232936]" />
-                <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                <div className="my-1 border-t border-[var(--border-main)]" />
+                <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
                   Banque d&apos;entrées
                 </div>
                 {(
@@ -1845,14 +1947,14 @@ export default function App() {
                       setInputBank(bank);
                       setOpenMenu(null);
                     }}
-                    className="w-full flex items-center justify-between px-3 py-1.5 text-left text-slate-200 hover:bg-[#1E2636] cursor-pointer"
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-left text-[var(--text-main)] hover:bg-[var(--bg-hover)] cursor-pointer"
                   >
                     <span>{label}</span>
                     {inputBank === bank && <Check className="w-3.5 h-3.5 text-amber-400" />}
                   </button>
                 ))}
-                <div className="my-1 border-t border-[#232936]" />
-                <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                <div className="my-1 border-t border-[var(--border-main)]" />
+                <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
                   Taille de l&apos;interface
                 </div>
                 {(
@@ -1871,17 +1973,20 @@ export default function App() {
                       setUiScaleMode(mode);
                       setOpenMenu(null);
                     }}
-                    className="w-full flex items-center justify-between px-3 py-1.5 text-left text-slate-200 hover:bg-[#1E2636] cursor-pointer"
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-left text-[var(--text-main)] hover:bg-[var(--bg-hover)] cursor-pointer"
                   >
                     <span>{label}</span>
                     {uiScaleMode === mode && <Check className="w-3.5 h-3.5 text-sky-400" />}
                   </button>
                 ))}
-                <div className="my-1 border-t border-[#232936]" />
+                <div className="my-1 border-t border-[var(--border-main)]" />
                 <button
                   type="button"
-                  onClick={() => setShowPlayerBar((v) => !v)}
-                  className="w-full flex items-center justify-between px-3 py-1.5 text-left text-slate-200 hover:bg-[#1E2636] cursor-pointer"
+                  onClick={() => {
+                    setShowPlayerBar((v) => !v);
+                    setOpenMenu(null);
+                  }}
+                  className="w-full flex items-center justify-between px-3 py-1.5 text-left text-[var(--text-main)] hover:bg-[var(--bg-hover)] cursor-pointer"
                 >
                   <span>Afficher lecteur MP3/WAV</span>
                   {showPlayerBar && <Check className="w-3.5 h-3.5 text-emerald-400" />}
@@ -1890,7 +1995,38 @@ export default function App() {
             )}
           </div>
 
-          <div className="w-px h-5 bg-[#232936] mx-1 hidden sm:block" />
+          {/* Menu À propos */}
+          <div className="relative">
+            <button
+              type="button"
+              aria-expanded={openMenu === 'apropos'}
+              onClick={() => setOpenMenu((m) => (m === 'apropos' ? null : 'apropos'))}
+              className={`flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded border cursor-pointer whitespace-nowrap transition-colors ${
+                openMenu === 'apropos'
+                  ? 'bg-[var(--bg-hover)] text-[var(--text-main)] border-amber-400/60'
+                  : 'bg-[var(--bg-control)] text-[var(--text-main)] border-[var(--border-strong)] hover:border-slate-500'
+              }`}
+            >
+              <span>À propos</span>
+              <ChevronDown className="w-3 h-3 text-[var(--text-muted)]" />
+            </button>
+            {openMenu === 'apropos' && (
+              <div className="absolute left-0 top-full mt-1 w-64 rounded-md border border-[var(--border-strong)] bg-[var(--bg-panel)] shadow-xl p-3.5 z-50 text-xs">
+                <div className="font-bold text-sm text-[var(--text-main)]">
+                  UMC1820 Studio Mixer
+                </div>
+                <div className="text-amber-400 font-semibold mt-1">
+                  imaginé par Kapi
+                </div>
+                <div className="my-2 border-t border-[var(--border-main)]" />
+                <p className="text-[11px] text-[var(--text-muted)] leading-relaxed">
+                  Console audio temps réel macOS CoreAudio &amp; Linux ALSA/JACK · AU / VST3 / VST2 · Télécommande iPad WebSocket &amp; OSC.
+                </p>
+              </div>
+            )}
+          </div>
+
+          <div className="w-px h-5 bg-[var(--border-main)] mx-1 hidden sm:block" />
 
           <button
             type="button"
@@ -1955,7 +2091,7 @@ export default function App() {
 
       {/* MP3 / WAV Audio Player Bar (toggleable from Affichage menu) */}
       {showPlayerBar && (
-        <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-2 border-b border-[#232936] bg-[#0D1119]">
+        <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-2 border-b border-[var(--border-main)] bg-[var(--bg-player)]">
         <div className="flex flex-wrap items-center gap-2.5">
           <div className="flex items-center gap-1.5 text-xs font-medium text-slate-300">
             <Music className="w-3.5 h-3.5 text-amber-400" />
@@ -2128,36 +2264,42 @@ export default function App() {
                 height: frameBoxSize.height ? `${frameBoxSize.height}px` : undefined,
                 maxWidth: '100%',
               }}
-              className="relative overflow-auto border border-[#1E2430] rounded-md bg-[#0C1018]/70 p-2.5 pb-5"
+              className="relative overflow-auto border border-[var(--border-main)] rounded-md bg-[var(--bg-viewport)] p-2.5 pb-5"
             >
               <div
                 className="inline-flex items-stretch gap-2.5 min-w-max origin-top-left"
                 style={effectiveUiScale !== 1 ? { zoom: effectiveUiScale } : undefined}
               >
-                {/* Dynamic Input Strips (8 Stereo up to 16 Mono, filterable by Bank 1-8 / 9-16) */}
+                {/* Dynamic Input Strips (8 Stereo up to 16 Mono, reorderable, filterable by Bank 1-8 / 9-16) */}
                 {stripView !== 'buses' && (
                   <div className="flex flex-col gap-2">
-                    <div className="text-xs font-medium text-slate-400 px-1">
+                    <div className="text-xs font-medium text-[var(--text-muted)] px-1">
                       Entrées ({visibleInputStrips.length} affichées · {activeInputStrips.length} actives / {activeHwCaps.in} IN HW)
                     </div>
                     <div className="flex gap-2">
-                      {visibleInputStrips.map((strip) => (
-                        <ChannelStrip
-                          key={strip.id}
-                          strip={strip}
-                          meter={meters[strip.id] ?? EMPTY_METER}
-                          anySoloActive={anySoloActive}
-                          inputPairStereo={inputPairStereo}
-                          auxPairStereo={auxPairStereo}
-                          hardwareChannels={activeHwCaps}
-                          midiPorts={effectiveMidiPorts}
-                          onToggleInputPair={handleToggleInputPair}
-                          onUpdate={handleUpdateStrip}
-                          onOpenInsertModal={(stripId, slotIndex) =>
-                            setInsertTarget({ stripId, slotIndex })
-                          }
-                        />
-                      ))}
+                      {visibleInputStrips.map((strip) => {
+                        const activePos = activeInputStrips.findIndex((s) => s.id === strip.id);
+                        return (
+                          <ChannelStrip
+                            key={strip.id}
+                            strip={strip}
+                            meter={meters[strip.id] ?? EMPTY_METER}
+                            anySoloActive={anySoloActive}
+                            inputPairStereo={inputPairStereo}
+                            auxPairStereo={auxPairStereo}
+                            hardwareChannels={activeHwCaps}
+                            midiPorts={effectiveMidiPorts}
+                            canMoveLeft={activePos > 0}
+                            canMoveRight={activePos >= 0 && activePos + 1 < activeInputStrips.length}
+                            onMoveStrip={handleMoveInputStrip}
+                            onToggleInputPair={handleToggleInputPair}
+                            onUpdate={handleUpdateStrip}
+                            onOpenInsertModal={(stripId, slotIndex) =>
+                              setInsertTarget({ stripId, slotIndex })
+                            }
+                          />
+                        );
+                      })}
                     </div>
                   </div>
                 )}

@@ -11,6 +11,10 @@ fn main() -> eframe::Result<()> {
             .with_title("UMC1820 Studio Mixer — CoreAudio / ALSA")
             .with_inner_size([1200.0, 700.0])
             .with_min_inner_size([320.0, 220.0]),
+        #[cfg(target_os = "macos")]
+        renderer: eframe::Renderer::Wgpu,
+        #[cfg(not(target_os = "macos"))]
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
 
