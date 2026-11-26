@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
@@ -12,7 +12,6 @@ use symphonia::core::probe::Hint;
 #[derive(Debug, Clone)]
 pub struct DecodedAudioTrack {
     pub title: String,
-    pub path: PathBuf,
     pub sample_rate: u32,
     pub left: Vec<f32>,
     pub right: Vec<f32>,
@@ -126,7 +125,6 @@ pub fn decode_audio_file(path: &Path) -> Result<DecodedAudioTrack, String> {
 
     Ok(DecodedAudioTrack {
         title,
-        path: path.to_path_buf(),
         sample_rate,
         left,
         right,

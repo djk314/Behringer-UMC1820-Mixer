@@ -83,6 +83,7 @@ pub struct DiscoveredPlugin {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativePluginHandle {
+    #[allow(dead_code)]
     AudioUnit { unit_ptr: usize, title: String },
     Vst3 { controller_ptr: usize, title: String },
     Vst2 { effect_ptr: usize, title: String },
