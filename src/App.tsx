@@ -19,16 +19,20 @@ import { RoutingMatrixView } from './components/RoutingMatrixView';
 import { RustCodeExplorer } from './components/RustCodeExplorer';
 import { RUST_PROJECT_FILES } from './data/rustProjectFiles';
 import {
+  AudioBufferLatencyPreset,
   AuxPairStereoState,
   AuxSendsTuple,
   HardwareInputRoute,
   HardwareOutputRoute,
+  InputPairStereoState,
   InsertPluginSlot,
   MAX_AUX_PAIRS,
+  MAX_INPUT_PAIRS,
   MAX_INSERTS_PER_STRIP,
   MeterLevel,
   MixerSetSnapshot,
   NUM_AUX_BUSES,
+  NUM_INPUT_STRIPS,
   PLUGIN_CATALOG,
   PlayerStatus,
   PluginDescriptor,
@@ -41,7 +45,12 @@ import { buildZipArchive } from './utils/zipBuilder';
 type ActiveTab = 'console' | 'routing' | 'remote' | 'rust';
 type OsDriverProfile = 'macos_coreaudio' | 'linux_alsa';
 type StripViewFilter = 'all' | 'inputs' | 'buses';
+type InputBankFilter = 'all' | 'b1' | 'b2';
 type HardwareProfileId = 'umc1820' | 'stereo_2x2' | 'quad_4x4' | 'studio_16x16';
+
+const BUFFER_LATENCY_PRESETS: AudioBufferLatencyPreset[] = [64, 128, 256, 512, 1024, 2048];
+const DEFAULT_INPUT_PAIRS: InputPairStereoState = [true, true, true, true, true, true, true, true];
+const DEFAULT_AUX_PAIRS: AuxPairStereoState = [true, true, true, true];
 
 const HARDWARE_PROFILES: Record<
   HardwareProfileId,
@@ -65,13 +74,19 @@ function createEmptyInserts(): InsertPluginSlot[] {
 }
 
 function createInitialStrips(): StripState[] {
-  const inputs: StripState[] = Array.from({ length: 8 }, (_, i) => {
-    const inputRoute: HardwareInputRoute = { kind: 'mono', channel: i };
+  const inputs: StripState[] = Array.from({ length: NUM_INPUT_STRIPS }, (_, i) => {
+    const pairIdx = Math.floor(i / 2);
+    const isPrimary = i % 2 === 0;
+    const ch1 = pairIdx * 2 + 1;
+    const ch2 = pairIdx * 2 + 2;
+    const inputRoute: HardwareInputRoute = isPrimary
+      ? { kind: 'stereo', channel: pairIdx * 2 }
+      : { kind: 'mono', channel: i };
     return {
       id: `in-${i + 1}`,
       index: i,
       kind: 'input',
-      name: `Tranche ${i + 1}`,
+      name: isPrimary ? `IN ${ch1}/${ch2}` : `IN ${i + 1}`,
       hardwareChannelLabel: formatInputRouteLabel(inputRoute),
       inputRoute,
       outputRoute: { kind: 'master' },
@@ -92,15 +107,15 @@ function createInitialStrips(): StripState[] {
       source:
         i === 0
           ? 'kick_groove'
-          : i === 1
+          : i === 2
             ? 'bass_synth'
-            : i === 2
+            : i === 4
               ? 'epiano_chord'
               : 'none',
     };
   });
 
-  // Preload realistic demo inserts on first channels
+  // Preload realistic demo inserts on the first active stereo input pairs (0, 2, 4)
   inputs[0].name = 'Kick / Drums';
   inputs[0].inserts[0] = {
     slotIndex: 0,
@@ -111,23 +126,23 @@ function createInitialStrips(): StripState[] {
   inputs[0].eq.lowGainDb = 2.5;
   inputs[0].eq.highGainDb = 1.5;
 
-  inputs[1].name = 'Basse Synth';
-  inputs[1].inserts[0] = {
+  inputs[2].name = 'Basse Synth';
+  inputs[2].inserts[0] = {
     slotIndex: 0,
     plugin: PLUGIN_CATALOG[2], // AUFilter HPF
     bypassed: false,
     params: { ...PLUGIN_CATALOG[2].defaultParams, freq: 38 },
   };
-  inputs[1].inserts[1] = {
+  inputs[2].inserts[1] = {
     slotIndex: 1,
     plugin: PLUGIN_CATALOG[1], // ConsoleDrive Tube (VST3)
     bypassed: false,
     params: { ...PLUGIN_CATALOG[1].defaultParams },
   };
 
-  inputs[2].name = 'E-Piano';
-  inputs[2].auxSends = [30, 0, 15, 0, 0, 0, 0, 0];
-  inputs[2].inserts[0] = {
+  inputs[4].name = 'E-Piano';
+  inputs[4].auxSends = [30, 0, 15, 0, 0, 0, 0, 0];
+  inputs[4].inserts[0] = {
     slotIndex: 0,
     plugin: PLUGIN_CATALOG[3], // Dimension Ensemble (VST3)
     bypassed: false,
@@ -142,7 +157,7 @@ function createInitialStrips(): StripState[] {
       : { kind: 'mono', channel: idx };
     return {
       id: `aux-${idx + 1}`,
-      index: 8 + idx,
+      index: NUM_INPUT_STRIPS + idx,
       kind: 'aux',
       name: isPrimary ? `Aux ${pairIdx * 2 + 1}/${pairIdx * 2 + 2}` : `Aux ${idx + 1}`,
       hardwareChannelLabel: formatOutputRouteLabel(outputRoute),
@@ -176,7 +191,7 @@ function createInitialStrips(): StripState[] {
   const masterOut: HardwareOutputRoute = { kind: 'stereo', channel: 0 };
   const master: StripState = {
     id: 'master',
-    index: 16,
+    index: NUM_INPUT_STRIPS + NUM_AUX_BUSES,
     kind: 'master',
     name: 'Master',
     hardwareChannelLabel: formatOutputRouteLabel(masterOut),
@@ -210,7 +225,9 @@ function createInitialStrips(): StripState[] {
 
 function normalizeLoadedSnapshot(raw: unknown): {
   strips: StripState[];
+  inputPairStereo: InputPairStereoState;
   auxPairStereo: AuxPairStereoState;
+  bufferFrames?: AudioBufferLatencyPreset;
   playerLoop?: boolean;
   playerGain?: number;
   playerTargetStripId?: string | null;
@@ -222,7 +239,21 @@ function normalizeLoadedSnapshot(raw: unknown): {
   const base = createInitialStrips();
   const baseById = new Map(base.map((s) => [s.id, s]));
 
-  const auxPairStereo: AuxPairStereoState = [true, true, true, true];
+  const loadedInputCount = obj.strips.filter((s) => s?.kind === 'input').length;
+  const isLegacyV1V2 = (obj.version ?? 1) < 3 && !Array.isArray(obj.inputPairStereo) && loadedInputCount <= 8;
+  const inputPairStereo: InputPairStereoState = isLegacyV1V2
+    ? [false, false, false, false, true, true, true, true]
+    : ([...DEFAULT_INPUT_PAIRS] as InputPairStereoState);
+
+  if (Array.isArray(obj.inputPairStereo)) {
+    for (let i = 0; i < MAX_INPUT_PAIRS; i++) {
+      if (typeof obj.inputPairStereo[i] === 'boolean') {
+        inputPairStereo[i] = obj.inputPairStereo[i];
+      }
+    }
+  }
+
+  const auxPairStereo: AuxPairStereoState = [...DEFAULT_AUX_PAIRS] as AuxPairStereoState;
   if (Array.isArray(obj.auxPairStereo)) {
     for (let i = 0; i < MAX_AUX_PAIRS; i++) {
       if (typeof obj.auxPairStereo[i] === 'boolean') {
@@ -240,7 +271,6 @@ function normalizeLoadedSnapshot(raw: unknown): {
     const rawAux = Array.isArray(loaded.auxSends) ? loaded.auxSends : [];
     const normalizedAux: AuxSendsTuple = [...EMPTY_AUX_SENDS] as AuxSendsTuple;
     if (rawAux.length === 4) {
-      // Upgrade legacy 4-pair sends into slots 0, 2, 4, 6
       normalizedAux[0] = Number(rawAux[0]) || 0;
       normalizedAux[2] = Number(rawAux[1]) || 0;
       normalizedAux[4] = Number(rawAux[2]) || 0;
@@ -273,6 +303,12 @@ function normalizeLoadedSnapshot(raw: unknown): {
       }
     }
 
+    const rawOutRoute = loaded.outputRoute ?? target.outputRoute;
+    const outputRoute =
+      isLegacyV1V2 && target.kind === 'input' && rawOutRoute.kind === 'none'
+        ? ({ kind: 'master' } as HardwareOutputRoute)
+        : rawOutRoute;
+
     const merged: StripState = {
       ...target,
       name: typeof loaded.name === 'string' && loaded.name.trim() ? loaded.name : target.name,
@@ -281,7 +317,7 @@ function normalizeLoadedSnapshot(raw: unknown): {
           ? loaded.hardwareChannelLabel
           : target.hardwareChannelLabel,
       inputRoute: loaded.inputRoute ?? target.inputRoute,
-      outputRoute: loaded.outputRoute ?? target.outputRoute,
+      outputRoute,
       gainDb: typeof loaded.gainDb === 'number' ? loaded.gainDb : target.gainDb,
       inserts: normalizedInserts,
       eq: {
@@ -301,9 +337,17 @@ function normalizeLoadedSnapshot(raw: unknown): {
     baseById.set(target.id, merged);
   }
 
+  const validBuf =
+    typeof obj.bufferFrames === 'number' &&
+    BUFFER_LATENCY_PRESETS.includes(obj.bufferFrames as AudioBufferLatencyPreset)
+      ? (obj.bufferFrames as AudioBufferLatencyPreset)
+      : undefined;
+
   return {
     strips: base.map((b) => baseById.get(b.id) ?? b),
+    inputPairStereo,
     auxPairStereo,
+    bufferFrames: validBuf,
     playerLoop: typeof obj.playerLoop === 'boolean' ? obj.playerLoop : undefined,
     playerGain: typeof obj.playerGain === 'number' ? obj.playerGain : undefined,
     playerTargetStripId:
@@ -338,20 +382,28 @@ export default function App() {
   const [driverProfile, setDriverProfile] = useState<OsDriverProfile>('macos_coreaudio');
   const [hardwareProfile, setHardwareProfile] = useState<HardwareProfileId>('umc1820');
   const [strips, setStrips] = useState<StripState[]>(createInitialStrips);
-  const [auxPairStereo, setAuxPairStereo] = useState<AuxPairStereoState>([
-    true,
-    true,
-    true,
-    true,
-  ]);
+  const [inputPairStereo, setInputPairStereo] = useState<InputPairStereoState>(
+    () => [...DEFAULT_INPUT_PAIRS] as InputPairStereoState
+  );
+  const [auxPairStereo, setAuxPairStereo] = useState<AuxPairStereoState>(
+    () => [...DEFAULT_AUX_PAIRS] as AuxPairStereoState
+  );
+  const [bufferFrames, setBufferFrames] = useState<AudioBufferLatencyPreset>(128);
   const [engineRunning, setEngineRunning] = useState(false);
   const [sampleRate, setSampleRate] = useState(48000);
   const [meters, setMeters] = useState<Record<string, MeterLevel>>({});
   const [insertTarget, setInsertTarget] = useState<{ stripId: string; slotIndex: number } | null>(
     null
   );
-  const [uiScale, setUiScale] = useState<number>(1);
+  const [uiScaleMode, setUiScaleMode] = useState<'auto' | number>('auto');
+  const [autoScale, setAutoScale] = useState<number>(1);
+  const [frameBoxSize, setFrameBoxSize] = useState<{ width: number | null; height: number | null }>({
+    width: null,
+    height: null,
+  });
+  const consoleViewportRef = useRef<HTMLDivElement | null>(null);
   const [stripView, setStripView] = useState<StripViewFilter>('all');
+  const [inputBank, setInputBank] = useState<InputBankFilter>('all');
 
   // Set Save / Load feedback
   const [setNotice, setSetNotice] = useState<string | null>(null);
@@ -424,8 +476,20 @@ export default function App() {
           const msg = JSON.parse(String(ev.data));
           if (msg.type === 'state' && Array.isArray(msg.strips)) {
             setRemoteDeviceName(typeof msg.device === 'string' ? msg.device : 'Mac');
-            if (Array.isArray(msg.aux_pair_stereo) && msg.aux_pair_stereo.length === 4) {
+            if (
+              Array.isArray(msg.input_pair_stereo) &&
+              msg.input_pair_stereo.length === MAX_INPUT_PAIRS
+            ) {
+              setInputPairStereo(msg.input_pair_stereo as InputPairStereoState);
+            }
+            if (Array.isArray(msg.aux_pair_stereo) && msg.aux_pair_stereo.length === MAX_AUX_PAIRS) {
               setAuxPairStereo(msg.aux_pair_stereo as AuxPairStereoState);
+            }
+            if (
+              typeof msg.buffer_frames === 'number' &&
+              BUFFER_LATENCY_PRESETS.includes(msg.buffer_frames as AudioBufferLatencyPreset)
+            ) {
+              setBufferFrames(msg.buffer_frames as AudioBufferLatencyPreset);
             }
             setStrips((prev) =>
               prev.map((localStrip, idx) => {
@@ -494,16 +558,23 @@ export default function App() {
           } else if (msg.type === 'meters' && Array.isArray(msg.meters)) {
             setMeters((prev) => {
               const next: Record<string, MeterLevel> = { ...prev };
-              msg.meters.forEach((m: { pl: number; pr: number; rl: number; rr: number; clip: boolean }, i: number) => {
-                const id = i < 8 ? `in-${i + 1}` : i < 16 ? `aux-${i - 7}` : 'master';
-                next[id] = {
-                  peakDbL: m.pl,
-                  peakDbR: m.pr,
-                  rmsDbL: m.rl,
-                  rmsDbR: m.rr,
-                  clip: Boolean(m.clip),
-                };
-              });
+              msg.meters.forEach(
+                (m: { pl: number; pr: number; rl: number; rr: number; clip: boolean }, i: number) => {
+                  const id =
+                    i < NUM_INPUT_STRIPS
+                      ? `in-${i + 1}`
+                      : i < NUM_INPUT_STRIPS + NUM_AUX_BUSES
+                        ? `aux-${i - NUM_INPUT_STRIPS + 1}`
+                        : 'master';
+                  next[id] = {
+                    peakDbL: m.pl,
+                    peakDbR: m.pr,
+                    rmsDbL: m.rl,
+                    rmsDbR: m.rr,
+                    clip: Boolean(m.clip),
+                  };
+                }
+              );
               return next;
             });
             if (msg.player) {
@@ -530,9 +601,9 @@ export default function App() {
   // Sync mixer state into Web Audio DSP graph whenever parameters change
   useEffect(() => {
     if (engineRef.current && engineRunning) {
-      engineRef.current.syncAll(strips, auxPairStereo);
+      engineRef.current.syncAll(strips, inputPairStereo, auxPairStereo);
     }
-  }, [strips, auxPairStereo, engineRunning]);
+  }, [strips, inputPairStereo, auxPairStereo, engineRunning]);
 
   // 60fps real-time VU metering & player transport progress loop
   useEffect(() => {
@@ -569,8 +640,8 @@ export default function App() {
       await engine.stop();
       setEngineRunning(false);
     } else {
-      await engine.start(strips);
-      engine.syncAll(strips, auxPairStereo);
+      await engine.setBufferSize(bufferFrames, strips, inputPairStereo, auxPairStereo);
+      await engine.start(strips, inputPairStereo, auxPairStereo);
       engine.setPlayerLoop(playerLoop);
       engine.setPlayerGain(playerGain);
       engine.setPlayerTarget(playerTargetStripId);
@@ -651,6 +722,120 @@ export default function App() {
     );
   };
 
+  const handleToggleInputPair = (pairIndex: number) => {
+    if (pairIndex < 0 || pairIndex >= MAX_INPUT_PAIRS) return;
+    const nextIsStereo = !inputPairStereo[pairIndex];
+    sendRemoteCmd({ type: 'set_input_pair_stereo', pair: pairIndex, stereo: nextIsStereo });
+    setInputPairStereo((prev) => {
+      const next = [...prev] as InputPairStereoState;
+      next[pairIndex] = nextIsStereo;
+      return next;
+    });
+
+    const primaryId = `in-${pairIndex * 2 + 1}`;
+    const secondaryId = `in-${pairIndex * 2 + 2}`;
+    const ch1 = pairIndex * 2 + 1;
+    const ch2 = pairIndex * 2 + 2;
+
+    setStrips((prev) =>
+      prev.map((s) => {
+        if (s.id === primaryId) {
+          const nextRoute: HardwareInputRoute = nextIsStereo
+            ? { kind: 'stereo', channel: pairIndex * 2 }
+            : { kind: 'mono', channel: pairIndex * 2 };
+          const nextName = nextIsStereo
+            ? s.name === `IN ${ch1}`
+              ? `IN ${ch1}/${ch2}`
+              : s.name
+            : s.name === `IN ${ch1}/${ch2}`
+              ? `IN ${ch1}`
+              : s.name;
+          return {
+            ...s,
+            name: nextName,
+            inputRoute: nextRoute,
+            hardwareChannelLabel: formatInputRouteLabel(nextRoute),
+          };
+        }
+        if (s.id === secondaryId && !nextIsStereo) {
+          const nextRoute: HardwareInputRoute = { kind: 'mono', channel: pairIndex * 2 + 1 };
+          return {
+            ...s,
+            inputRoute: nextRoute,
+            hardwareChannelLabel: formatInputRouteLabel(nextRoute),
+          };
+        }
+        return s;
+      })
+    );
+  };
+
+  const handleToggleAllInputsMode = () => {
+    const anyMono = inputPairStereo.some((v) => !v);
+    const targetStereo = anyMono;
+    for (let p = 0; p < MAX_INPUT_PAIRS; p++) {
+      sendRemoteCmd({ type: 'set_input_pair_stereo', pair: p, stereo: targetStereo });
+    }
+    setInputPairStereo(
+      [targetStereo, targetStereo, targetStereo, targetStereo, targetStereo, targetStereo, targetStereo, targetStereo]
+    );
+    if (!targetStereo && inputBank === 'all') {
+      setInputBank('b1');
+    } else if (targetStereo) {
+      setInputBank('all');
+    }
+
+    setStrips((prev) =>
+      prev.map((s) => {
+        if (s.kind !== 'input') return s;
+        const idx = s.index;
+        const pairIdx = Math.floor(idx / 2);
+        const ch1 = pairIdx * 2 + 1;
+        const ch2 = pairIdx * 2 + 2;
+        if (idx % 2 === 0) {
+          const nextRoute: HardwareInputRoute = targetStereo
+            ? { kind: 'stereo', channel: pairIdx * 2 }
+            : { kind: 'mono', channel: pairIdx * 2 };
+          const nextName = targetStereo
+            ? s.name === `IN ${ch1}`
+              ? `IN ${ch1}/${ch2}`
+              : s.name
+            : s.name === `IN ${ch1}/${ch2}`
+              ? `IN ${ch1}`
+              : s.name;
+          return {
+            ...s,
+            name: nextName,
+            inputRoute: nextRoute,
+            hardwareChannelLabel: formatInputRouteLabel(nextRoute),
+          };
+        } else if (!targetStereo) {
+          const nextRoute: HardwareInputRoute = { kind: 'mono', channel: idx };
+          return {
+            ...s,
+            inputRoute: nextRoute,
+            hardwareChannelLabel: formatInputRouteLabel(nextRoute),
+          };
+        }
+        return s;
+      })
+    );
+  };
+
+  const handleCycleInputBank = () => {
+    setInputBank((prev) => (prev === 'all' ? 'b1' : prev === 'b1' ? 'b2' : 'all'));
+  };
+
+  const handleBufferSizeChange = async (nextFrames: AudioBufferLatencyPreset) => {
+    setBufferFrames(nextFrames);
+    if (engineRef.current && engineRunning) {
+      await engineRef.current.setBufferSize(nextFrames, strips, inputPairStereo, auxPairStereo);
+      setSampleRate(engineRef.current.getSampleRate());
+    }
+    const ms = ((nextFrames / Math.max(1, sampleRate)) * 1000).toFixed(1);
+    showTemporaryNotice(`Buffer audio : ${nextFrames} smp (~${ms} ms)`);
+  };
+
   const handleToggleAuxPair = (pairIndex: number) => {
     if (pairIndex < 0 || pairIndex >= MAX_AUX_PAIRS) return;
     const nextIsStereo = !auxPairStereo[pairIndex];
@@ -715,7 +900,7 @@ export default function App() {
     setStrips((prev) =>
       prev.map((s) => {
         if (s.kind !== 'aux') return s;
-        const idx = s.index - 8;
+        const idx = s.index - NUM_INPUT_STRIPS;
         const pairIdx = Math.floor(idx / 2);
         const ch1 = pairIdx * 2 + 1;
         const ch2 = pairIdx * 2 + 2;
@@ -757,8 +942,10 @@ export default function App() {
 
   const handleSaveSet = () => {
     const snapshot: MixerSetSnapshot = {
-      version: 2,
+      version: 3,
+      inputPairStereo,
       auxPairStereo,
+      bufferFrames,
       strips,
       playerLoop,
       playerGain,
@@ -790,7 +977,20 @@ export default function App() {
         return;
       }
       setStrips(normalized.strips);
+      setInputPairStereo(normalized.inputPairStereo);
       setAuxPairStereo(normalized.auxPairStereo);
+      if (normalized.bufferFrames !== undefined) {
+        setBufferFrames(normalized.bufferFrames);
+        if (engineRef.current && engineRunning) {
+          await engineRef.current.setBufferSize(
+            normalized.bufferFrames,
+            normalized.strips,
+            normalized.inputPairStereo,
+            normalized.auxPairStereo
+          );
+          setSampleRate(engineRef.current.getSampleRate());
+        }
+      }
       if (normalized.playerLoop !== undefined) {
         setPlayerLoop(normalized.playerLoop);
         engineRef.current?.setPlayerLoop(normalized.playerLoop);
@@ -814,8 +1014,9 @@ export default function App() {
     e.target.value = '';
     if (!file || !engineRef.current) return;
     try {
+      await engineRef.current.setBufferSize(bufferFrames, strips, inputPairStereo, auxPairStereo);
       const status = await engineRef.current.loadAudioFile(file, strips);
-      engineRef.current.syncAll(strips, auxPairStereo);
+      engineRef.current.syncAll(strips, inputPairStereo, auxPairStereo);
       engineRef.current.setPlayerLoop(playerLoop);
       engineRef.current.setPlayerGain(playerGain);
       engineRef.current.setPlayerTarget(playerTargetStripId);
@@ -910,6 +1111,23 @@ export default function App() {
   const auxStrips = useMemo(() => strips.filter((s) => s.kind === 'aux'), [strips]);
   const masterStrip = useMemo(() => strips.find((s) => s.kind === 'master'), [strips]);
 
+  const activeInputStrips = useMemo(() => {
+    const visible: StripState[] = [];
+    for (let p = 0; p < MAX_INPUT_PAIRS; p++) {
+      const primary = inputStrips[p * 2];
+      const secondary = inputStrips[p * 2 + 1];
+      if (primary) visible.push(primary);
+      if (!inputPairStereo[p] && secondary) visible.push(secondary);
+    }
+    return visible;
+  }, [inputStrips, inputPairStereo]);
+
+  const visibleInputStrips = useMemo(() => {
+    if (inputBank === 'b1') return activeInputStrips.filter((s) => s.index < 8);
+    if (inputBank === 'b2') return activeInputStrips.filter((s) => s.index >= 8);
+    return activeInputStrips;
+  }, [activeInputStrips, inputBank]);
+
   const visibleAuxStrips = useMemo(() => {
     const visible: StripState[] = [];
     for (let p = 0; p < MAX_AUX_PAIRS; p++) {
@@ -926,8 +1144,60 @@ export default function App() {
     : null;
 
   const activeHwCaps = HARDWARE_PROFILES[hardwareProfile];
+  const anyInputMono = inputPairStereo.some((v) => !v);
   const anyAuxMono = auxPairStereo.some((v) => !v);
-  const totalVisibleCount = 8 + visibleAuxStrips.length + 1;
+  const visibleStripCount =
+    (stripView === 'buses' ? 0 : visibleInputStrips.length) +
+    (stripView === 'inputs' ? 0 : visibleAuxStrips.length + 1);
+
+  useEffect(() => {
+    const el = consoleViewportRef.current;
+    if (!el || activeTab !== 'console') return;
+    const recomputeScale = (width: number, height: number) => {
+      if (width <= 0) return;
+      const targetContentW = Math.max(480, visibleStripCount * 146 + 40);
+      const scaleW = width / targetContentW;
+      const scaleH = height > 0 ? height / 760 : 1;
+      const next = Math.max(0.45, Math.min(1.08, Math.min(scaleW, Math.max(scaleH, 0.55))));
+      setAutoScale(Math.round(next * 100) / 100);
+    };
+    const rect = el.getBoundingClientRect();
+    recomputeScale(rect.width, rect.height);
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        recomputeScale(entry.contentRect.width, entry.contentRect.height);
+      }
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [activeTab, visibleStripCount, frameBoxSize.width, frameBoxSize.height]);
+
+  const handleStartCornerResize = (e: React.PointerEvent<HTMLDivElement>) => {
+    const el = consoleViewportRef.current;
+    if (!el) return;
+    e.preventDefault();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const rect = el.getBoundingClientRect();
+    const startW = rect.width;
+    const startH = rect.height;
+
+    const onMove = (moveEvent: PointerEvent) => {
+      const nextW = Math.max(360, Math.round(startW + (moveEvent.clientX - startX)));
+      const nextH = Math.max(320, Math.round(startH + (moveEvent.clientY - startY)));
+      setFrameBoxSize({ width: nextW, height: nextH });
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  };
+
+  const effectiveUiScale = uiScaleMode === 'auto' ? autoScale : uiScaleMode;
+  const totalVisibleCount = activeInputStrips.length + visibleAuxStrips.length + 1;
+  const bufferLatencyMs = ((bufferFrames / Math.max(1, sampleRate)) * 1000).toFixed(1);
 
   return (
     <div className="min-h-screen flex flex-col bg-[#0B0E14] text-slate-100">
@@ -1091,12 +1361,66 @@ export default function App() {
             <option value="linux_alsa">Linux · ALSA / JACK (VST3 / VST2)</option>
           </select>
 
+          <select
+            aria-label="Latence / Buffer carte son"
+            value={bufferFrames}
+            onChange={(e) =>
+              void handleBufferSizeChange(Number(e.target.value) as AudioBufferLatencyPreset)
+            }
+            className="bg-[#0B0E14] border border-sky-500/35 rounded px-2.5 py-1.5 text-xs text-sky-200 font-mono focus:outline-none focus:border-sky-400"
+            title="Taille du buffer audio (latence carte son)"
+          >
+            {BUFFER_LATENCY_PRESETS.map((frames) => {
+              const ms = ((frames / Math.max(1, sampleRate)) * 1000).toFixed(1);
+              return (
+                <option key={`buf-${frames}`} value={frames}>
+                  Latence : {frames} smp (~{ms} ms)
+                </option>
+              );
+            })}
+          </select>
+
           <span className="text-xs text-slate-400 font-mono tabular-nums hidden xl:inline">
-            {sampleRate} Hz
+            {sampleRate} Hz · {bufferLatencyMs} ms
           </span>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={handleToggleAllInputsMode}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded border cursor-pointer whitespace-nowrap transition-colors ${
+              anyInputMono
+                ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40 hover:bg-emerald-500/25'
+                : 'bg-amber-500/15 text-amber-300 border-amber-500/40 hover:bg-amber-500/25'
+            }`}
+            title="Doubler les entrées entre 8 paires Stéréo et 16 tranches Mono indépendantes"
+          >
+            <Split className="w-3.5 h-3.5" />
+            {anyInputMono
+              ? `Entrées (${activeInputStrips.length} actifs → 8 Stéréo)`
+              : 'Entrées : 8 Stéréo → 16 Mono'}
+          </button>
+
+          {activeTab === 'console' && (
+            <button
+              type="button"
+              onClick={handleCycleInputBank}
+              className={`px-2.5 py-1.5 text-xs font-mono font-medium rounded border cursor-pointer whitespace-nowrap transition-colors ${
+                inputBank === 'all'
+                  ? 'bg-[#1A202C] text-slate-200 border-[#2D3545] hover:border-amber-400'
+                  : 'bg-amber-500/20 text-amber-300 border-amber-500/50 hover:bg-amber-500/30'
+              }`}
+              title="Basculer entre Banque IN 1–8, Banque IN 9–16 ou Toutes (pour ne pas encombrer l'interface)"
+            >
+              {inputBank === 'b1'
+                ? 'Banque IN : 1–8'
+                : inputBank === 'b2'
+                  ? 'Banque IN : 9–16'
+                  : `Banque IN : 1–16 (${activeInputStrips.length})`}
+            </button>
+          )}
+
           <button
             type="button"
             onClick={handleToggleAllAuxMode}
@@ -1108,7 +1432,9 @@ export default function App() {
             title="Basculer tous les bus auxiliaires entre 4 paires Stéréo et 8 bus Mono"
           >
             <Split className="w-3.5 h-3.5" />
-            {anyAuxMono ? `Aux (${visibleAuxStrips.length} actifs → 4 Stéréo)` : 'Aux : 4 Stéréo → 8 Mono'}
+            {anyAuxMono
+              ? `Aux (${visibleAuxStrips.length} actifs → 4 Stéréo)`
+              : 'Aux : 4 Stéréo → 8 Mono'}
           </button>
 
           {activeTab === 'console' && (
@@ -1120,19 +1446,24 @@ export default function App() {
                 className="bg-[#0B0E14] border border-[#232936] rounded px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-sky-500"
               >
                 <option value="all">Toutes ({totalVisibleCount})</option>
-                <option value="inputs">8 Entrées (1–8)</option>
+                <option value="inputs">Entrées ({visibleInputStrips.length})</option>
                 <option value="buses">Aux &amp; Master ({visibleAuxStrips.length + 1})</option>
               </select>
               <select
                 aria-label="Taille de l'interface"
-                value={uiScale}
-                onChange={(e) => setUiScale(Number(e.target.value))}
+                value={String(uiScaleMode)}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setUiScaleMode(val === 'auto' ? 'auto' : Number(val));
+                }}
                 className="bg-[#0B0E14] border border-[#232936] rounded px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-sky-500"
+                title="Auto adapte l'interface à la taille de la fenêtre / poignée de redimensionnement"
               >
-                <option value={1}>Taille 100%</option>
-                <option value={0.88}>Compact 88%</option>
-                <option value={0.76}>Petit écran 76%</option>
-                <option value={0.5}>Très compact 50%</option>
+                <option value="auto">Auto fenêtre ({Math.round(autoScale * 100)}%)</option>
+                <option value="1">Taille 100%</option>
+                <option value="0.88">Compact 88%</option>
+                <option value="0.76">Petit écran 76%</option>
+                <option value="0.55">Très compact 55%</option>
               </select>
             </>
           )}
@@ -1152,7 +1483,10 @@ export default function App() {
             type="button"
             onClick={() => {
               setStrips(createInitialStrips());
-              setAuxPairStereo([true, true, true, true]);
+              setInputPairStereo([...DEFAULT_INPUT_PAIRS] as InputPairStereoState);
+              setAuxPairStereo([...DEFAULT_AUX_PAIRS] as AuxPairStereoState);
+              setInputBank('all');
+              setFrameBoxSize({ width: null, height: null });
               showTemporaryNotice('Console réinitialisée');
             }}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-[#1A202C] text-slate-300 border border-[#2D3545] rounded hover:text-white cursor-pointer whitespace-nowrap"
@@ -1316,9 +1650,9 @@ export default function App() {
             className="bg-[#0B0E14] border border-[#232936] rounded px-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-sky-500"
           >
             <option value="master">Sortie : Master Direct</option>
-            {inputStrips.map((st, idx) => (
+            {activeInputStrips.map((st) => (
               <option key={`pl-${st.id}`} value={st.id}>
-                Vers Tranche {idx + 1} ({st.name})
+                Vers Tranche {st.index + 1} ({st.name})
               </option>
             ))}
           </select>
@@ -1328,27 +1662,37 @@ export default function App() {
       {/* Main Content */}
       <main className="flex-1 p-5 overflow-x-hidden">
         {activeTab === 'console' && (
-          <div className="flex flex-col gap-3">
-            <div className="overflow-auto pb-3">
+          <div className="flex flex-col gap-2">
+            <div
+              ref={consoleViewportRef}
+              style={{
+                width: frameBoxSize.width ? `${frameBoxSize.width}px` : '100%',
+                height: frameBoxSize.height ? `${frameBoxSize.height}px` : undefined,
+                maxWidth: '100%',
+              }}
+              className="relative overflow-auto border border-[#1E2430] rounded-md bg-[#0C1018]/70 p-2.5 pb-5"
+            >
               <div
                 className="inline-flex items-stretch gap-2.5 min-w-max origin-top-left"
-                style={uiScale !== 1 ? { zoom: uiScale } : undefined}
+                style={effectiveUiScale !== 1 ? { zoom: effectiveUiScale } : undefined}
               >
-                {/* 8 Input Strips */}
+                {/* Dynamic Input Strips (8 Stereo up to 16 Mono, filterable by Bank 1-8 / 9-16) */}
                 {stripView !== 'buses' && (
                   <div className="flex flex-col gap-2">
                     <div className="text-xs font-medium text-slate-400 px-1">
-                      8 Tranches d'entrée ({activeHwCaps.in} IN disponibles)
+                      Entrées ({visibleInputStrips.length} affichées · {activeInputStrips.length} actives / {activeHwCaps.in} IN HW)
                     </div>
                     <div className="flex gap-2">
-                      {inputStrips.map((strip) => (
+                      {visibleInputStrips.map((strip) => (
                         <ChannelStrip
                           key={strip.id}
                           strip={strip}
                           meter={meters[strip.id] ?? EMPTY_METER}
                           anySoloActive={anySoloActive}
+                          inputPairStereo={inputPairStereo}
                           auxPairStereo={auxPairStereo}
                           hardwareChannels={activeHwCaps}
+                          onToggleInputPair={handleToggleInputPair}
                           onUpdate={handleUpdateStrip}
                           onOpenInsertModal={(stripId, slotIndex) =>
                             setInsertTarget({ stripId, slotIndex })
@@ -1376,6 +1720,7 @@ export default function App() {
                           strip={strip}
                           meter={meters[strip.id] ?? EMPTY_METER}
                           anySoloActive={anySoloActive}
+                          inputPairStereo={inputPairStereo}
                           auxPairStereo={auxPairStereo}
                           hardwareChannels={activeHwCaps}
                           onToggleAuxPair={handleToggleAuxPair}
@@ -1403,6 +1748,7 @@ export default function App() {
                       strip={masterStrip}
                       meter={meters[masterStrip.id] ?? EMPTY_METER}
                       anySoloActive={anySoloActive}
+                      inputPairStereo={inputPairStereo}
                       auxPairStereo={auxPairStereo}
                       hardwareChannels={activeHwCaps}
                       onUpdate={handleUpdateStrip}
@@ -1413,6 +1759,20 @@ export default function App() {
                   </div>
                 )}
               </div>
+
+              {/* Corner Drag Resize Handle (Window-style gadget + double-click reset) */}
+              <div
+                role="separator"
+                aria-label="Poignée de redimensionnement de l'interface"
+                onPointerDown={handleStartCornerResize}
+                onDoubleClick={() => setFrameBoxSize({ width: null, height: null })}
+                title="Glisser pour redimensionner la console (double-clic pour réinitialiser)"
+                className="sticky bottom-0 left-full -mr-1.5 -mb-4 ml-auto w-5 h-5 flex items-end justify-end cursor-nwse-resize text-slate-400 hover:text-amber-300 select-none z-20"
+              >
+                <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 fill-none stroke-current" strokeWidth="1.6">
+                  <path d="M5 14L14 5M9.5 14L14 9.5M13.5 14L14 13.5" />
+                </svg>
+              </div>
             </div>
           </div>
         )}
@@ -1420,8 +1780,10 @@ export default function App() {
         {activeTab === 'routing' && (
           <RoutingMatrixView
             strips={strips}
+            inputPairStereo={inputPairStereo}
             auxPairStereo={auxPairStereo}
             onUpdateStrip={handleUpdateStrip}
+            onToggleInputPair={handleToggleInputPair}
             onToggleAuxPair={handleToggleAuxPair}
           />
         )}

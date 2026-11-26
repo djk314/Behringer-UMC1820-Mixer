@@ -2,11 +2,12 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const NUM_INPUT_STRIPS: usize = 8;
+pub const MAX_INPUT_PAIRS: usize = 8;
+pub const NUM_INPUT_STRIPS: usize = MAX_INPUT_PAIRS * 2; // 16 tranches d'entrée max (8 paires stéréo ou 16 mono séparées)
 pub const MAX_AUX_PAIRS: usize = 4;
 pub const NUM_AUX_STRIPS: usize = MAX_AUX_PAIRS * 2; // 8 bus Aux (4 paires stéréo ou 8 mono séparés)
 pub const MAX_INSERTS_PER_STRIP: usize = 5;
-pub const TOTAL_STRIPS: usize = NUM_INPUT_STRIPS + NUM_AUX_STRIPS + 1; // 8 IN + 8 AUX + 1 MASTER
+pub const TOTAL_STRIPS: usize = NUM_INPUT_STRIPS + NUM_AUX_STRIPS + 1; // 16 IN + 8 AUX + 1 MASTER
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StripKind {
@@ -152,12 +153,16 @@ pub struct StripState {
 impl StripState {
     pub fn new(index: usize, kind: StripKind, name: String) -> Self {
         let input_route = if kind == StripKind::Input {
-            InputSourceRoute::Mono(index)
+            if index % 2 == 0 {
+                InputSourceRoute::StereoPair(index)
+            } else {
+                InputSourceRoute::Mono(index)
+            }
         } else {
             InputSourceRoute::None
         };
         let output_route = match kind {
-            StripKind::Input => OutputTargetRoute::None,
+            StripKind::Input => OutputTargetRoute::MasterBus,
             StripKind::Aux => {
                 let aux_i = index.saturating_sub(NUM_INPUT_STRIPS);
                 if aux_i % 2 == 0 {
@@ -202,11 +207,15 @@ fn default_player_gain() -> f32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MixerSetFile {
     pub version: u32,
+    #[serde(default = "default_input_pairs")]
+    pub input_pair_stereo: [bool; MAX_INPUT_PAIRS],
     #[serde(default = "default_aux_pairs")]
     pub aux_pair_stereo: [bool; MAX_AUX_PAIRS],
     pub strips: Vec<StripState>,
     #[serde(default)]
     pub selected_device: Option<String>,
+    #[serde(default)]
+    pub buffer_frames: Option<u32>,
     #[serde(default)]
     pub player_file_path: Option<String>,
     #[serde(default)]
@@ -215,6 +224,10 @@ pub struct MixerSetFile {
     pub player_gain: f32,
     #[serde(default)]
     pub player_target: Option<usize>,
+}
+
+fn default_input_pairs() -> [bool; MAX_INPUT_PAIRS] {
+    [true; MAX_INPUT_PAIRS]
 }
 
 fn default_aux_pairs() -> [bool; MAX_AUX_PAIRS] {
@@ -261,6 +274,7 @@ pub enum MixerCommand {
     SetSolo { strip: usize, solo: bool },
     SetEq { strip: usize, eq: FiveBandEqParams },
     SetAuxSend { strip: usize, aux_idx: usize, level: f32 },
+    SetInputPairStereo { pair: usize, stereo: bool },
     SetAuxPairStereo { pair: usize, stereo: bool },
     SetInputRoute { strip: usize, route: InputSourceRoute },
     SetOutputRoute { strip: usize, route: OutputTargetRoute },

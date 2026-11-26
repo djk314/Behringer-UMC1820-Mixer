@@ -7,7 +7,7 @@ use crate::audio::plugin_host::{instantiate_plugin, scan_system_plugins, HostedP
 use crate::audio::state::{
     DiscoveredPlugin, InputSourceRoute, MeterFrame, MixerCommand, MixerSetFile, NativePluginHandle,
     OutputTargetRoute, PlayerProgress, PluginFormat, StripKind, StripState, MAX_AUX_PAIRS,
-    MAX_INSERTS_PER_STRIP, NUM_AUX_STRIPS, NUM_INPUT_STRIPS, TOTAL_STRIPS,
+    MAX_INPUT_PAIRS, MAX_INSERTS_PER_STRIP, NUM_AUX_STRIPS, NUM_INPUT_STRIPS, TOTAL_STRIPS,
 };
 use crate::remote::{
     RemoteCommand, RemoteMeterEntry, RemoteMetersPacket, RemotePlayerProgressView, RemoteServer,
@@ -35,7 +35,7 @@ enum UiScaleMode {
 impl UiScaleMode {
     fn label(self) -> &'static str {
         match self {
-            Self::Auto => "Auto",
+            Self::Auto => "Auto (Fenêtre)",
             Self::Scale50 => "50%",
             Self::Scale75 => "75%",
             Self::Scale85 => "85%",
@@ -56,11 +56,38 @@ impl StripViewFilter {
     fn label(self) -> &'static str {
         match self {
             Self::All => "Toutes",
-            Self::InputsOnly => "Entrées (1–8)",
+            Self::InputsOnly => "Entrées",
             Self::BusesOnly => "Aux & Master",
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputBankFilter {
+    All,
+    Bank1,
+    Bank2,
+}
+
+impl InputBankFilter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "IN: 1–16 (Tout)",
+            Self::Bank1 => "IN: 1–8",
+            Self::Bank2 => "IN: 9–16",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Bank1,
+            Self::Bank1 => Self::Bank2,
+            Self::Bank2 => Self::All,
+        }
+    }
+}
+
+const BUFFER_PRESETS: [u32; 6] = [64, 128, 256, 512, 1024, 2048];
 
 fn format_time(secs: f32) -> String {
     let s = secs.max(0.0).floor() as u32;
@@ -86,6 +113,7 @@ fn format_output_route(route: OutputTargetRoute) -> String {
 
 pub struct UmcMixerApp {
     strips: Vec<StripState>,
+    input_pair_stereo: [bool; MAX_INPUT_PAIRS],
     aux_pair_stereo: [bool; MAX_AUX_PAIRS],
     meters: [MeterFrame; TOTAL_STRIPS],
     // IMPORTANT : déclaré avant `offline_plugins` et `engine` pour fermer toutes les fenêtres natives avant le déchargement des plugins.
@@ -96,6 +124,7 @@ pub struct UmcMixerApp {
     midi_manager: MidiInputManager,
     devices: Vec<String>,
     selected_device: String,
+    requested_buffer_frames: u32,
     discovered_plugins: Vec<DiscoveredPlugin>,
     active_insert_target: Option<(usize, usize)>,
     modal_show_catalog: bool,
@@ -104,7 +133,9 @@ pub struct UmcMixerApp {
     last_plugin_error: Option<(usize, usize, String)>,
     last_native_ui_error: Option<(usize, usize, String)>,
     scale_mode: UiScaleMode,
+    native_ppp: Option<f32>,
     view_filter: StripViewFilter,
+    input_bank: InputBankFilter,
     status_error: Option<String>,
     status_info: Option<String>,
     // Lecteur audio MP3 / WAV
@@ -133,10 +164,12 @@ impl UmcMixerApp {
         let mut strips = default_mixer_strips();
         let devices = list_audio_devices();
         let discovered_plugins = scan_system_plugins();
-        let (mut engine, status_error) = match start_audio_engine(None) {
-            Ok(h) => (Some(h), None),
-            Err(e) => (None, Some(e)),
-        };
+        let requested_buffer_frames = 128_u32;
+        let (mut engine, status_error) =
+            match start_audio_engine(None, Some(requested_buffer_frames)) {
+                Ok(h) => (Some(h), None),
+                Err(e) => (None, Some(e)),
+            };
         let mut midi_manager = MidiInputManager::new();
         if let Some(eng) = engine.as_mut() {
             midi_manager.attach_sender(eng.midi_tx.take());
@@ -157,6 +190,7 @@ impl UmcMixerApp {
 
         let mut app = Self {
             strips,
+            input_pair_stereo: [true; MAX_INPUT_PAIRS],
             aux_pair_stereo: [true; MAX_AUX_PAIRS],
             meters: [MeterFrame::default(); TOTAL_STRIPS],
             native_editors: NativeEditorManager::new(),
@@ -166,6 +200,7 @@ impl UmcMixerApp {
             midi_manager,
             devices,
             selected_device,
+            requested_buffer_frames,
             discovered_plugins,
             active_insert_target: None,
             modal_show_catalog: false,
@@ -174,7 +209,9 @@ impl UmcMixerApp {
             last_plugin_error: None,
             last_native_ui_error: None,
             scale_mode: UiScaleMode::Auto,
+            native_ppp: None,
             view_filter: StripViewFilter::All,
+            input_bank: InputBankFilter::All,
             status_error,
             status_info: None,
             player_file_path: None,
@@ -200,7 +237,42 @@ impl UmcMixerApp {
         self.remote_state_dirty = true;
     }
 
+    fn restart_audio_engine(&mut self, device_name: Option<String>, buffer_frames: u32) {
+        self.native_editors.close_all();
+        self.native_handles = std::array::from_fn(|_| std::array::from_fn(|_| None));
+        self.offline_plugins = std::array::from_fn(|_| std::array::from_fn(|_| None));
+        self.engine = None;
+        self.requested_buffer_frames = buffer_frames.clamp(64, 2048);
+        let pref_dev = device_name.or_else(|| {
+            if self.selected_device == "Aucun périphérique" {
+                None
+            } else {
+                Some(self.selected_device.clone())
+            }
+        });
+        match start_audio_engine(pref_dev.as_deref(), Some(self.requested_buffer_frames)) {
+            Ok(mut h) => {
+                self.midi_manager.attach_sender(h.midi_tx.take());
+                self.selected_device = h.device_name.clone();
+                let master_idx = NUM_INPUT_STRIPS + NUM_AUX_STRIPS;
+                if h.out_channels < 10
+                    && self.strips[master_idx].output_route == OutputTargetRoute::StereoPair(8)
+                {
+                    self.strips[master_idx].output_route = OutputTargetRoute::StereoPair(0);
+                }
+                self.engine = Some(h);
+                self.status_error = None;
+            }
+            Err(e) => self.status_error = Some(e),
+        }
+        self.sync_all_state_to_engine(true);
+    }
+
     fn sync_all_state_to_engine(&mut self, reinstall_plugins: bool) {
+        for pair in 0..MAX_INPUT_PAIRS {
+            let stereo = self.input_pair_stereo[pair];
+            self.send(MixerCommand::SetInputPairStereo { pair, stereo });
+        }
         for pair in 0..MAX_AUX_PAIRS {
             let stereo = self.aux_pair_stereo[pair];
             self.send(MixerCommand::SetAuxPairStereo { pair, stereo });
@@ -216,12 +288,11 @@ impl UmcMixerApp {
                     strip: s_idx,
                     gain_db: st.gain_db,
                 });
-            } else {
-                self.send(MixerCommand::SetOutputRoute {
-                    strip: s_idx,
-                    route: st.output_route,
-                });
             }
+            self.send(MixerCommand::SetOutputRoute {
+                strip: s_idx,
+                route: st.output_route,
+            });
             self.send(MixerCommand::SetEq {
                 strip: s_idx,
                 eq: st.eq,
@@ -301,6 +372,41 @@ impl UmcMixerApp {
         self.send(MixerCommand::PlayerSetLoop(self.player_loop));
         self.send(MixerCommand::PlayerSetGain(self.player_gain));
         self.send(MixerCommand::PlayerSetTarget(self.player_target));
+    }
+
+    fn toggle_input_pair_stereo(&mut self, pair: usize, stereo: bool) {
+        if pair >= MAX_INPUT_PAIRS || self.input_pair_stereo[pair] == stereo {
+            return;
+        }
+        self.input_pair_stereo[pair] = stereo;
+        let idx_l = pair * 2;
+        let idx_r = idx_l + 1;
+        if stereo {
+            self.strips[idx_l].name = format!("IN {}/{}", pair * 2 + 1, pair * 2 + 2);
+            if let InputSourceRoute::Mono(ch) = self.strips[idx_l].input_route {
+                self.strips[idx_l].input_route = InputSourceRoute::StereoPair(ch & !1);
+                self.send(MixerCommand::SetInputRoute {
+                    strip: idx_l,
+                    route: self.strips[idx_l].input_route,
+                });
+            }
+        } else {
+            self.strips[idx_l].name = format!("IN {}", pair * 2 + 1);
+            self.strips[idx_r].name = format!("IN {}", pair * 2 + 2);
+            if let InputSourceRoute::StereoPair(ch) = self.strips[idx_l].input_route {
+                self.strips[idx_l].input_route = InputSourceRoute::Mono(ch);
+                self.strips[idx_r].input_route = InputSourceRoute::Mono(ch + 1);
+                self.send(MixerCommand::SetInputRoute {
+                    strip: idx_l,
+                    route: self.strips[idx_l].input_route,
+                });
+                self.send(MixerCommand::SetInputRoute {
+                    strip: idx_r,
+                    route: self.strips[idx_r].input_route,
+                });
+            }
+        }
+        self.send(MixerCommand::SetInputPairStereo { pair, stereo });
     }
 
     fn toggle_aux_pair_stereo(&mut self, pair: usize, stereo: bool) {
@@ -383,10 +489,12 @@ impl UmcMixerApp {
             path.set_extension("umcset");
         }
         let set_data = MixerSetFile {
-            version: 2,
+            version: 3,
+            input_pair_stereo: self.input_pair_stereo,
             aux_pair_stereo: self.aux_pair_stereo,
             strips: self.strips.clone(),
             selected_device: Some(self.selected_device.clone()),
+            buffer_frames: Some(self.requested_buffer_frames),
             player_file_path: self.player_file_path.clone(),
             player_loop: self.player_loop,
             player_gain: self.player_gain,
@@ -431,21 +539,30 @@ impl UmcMixerApp {
         self.active_insert_target = None;
 
         let mut next_strips = default_mixer_strips();
+        let mut next_input_pairs = parsed.input_pair_stereo;
         if parsed.strips.len() == TOTAL_STRIPS {
             for (i, mut st) in parsed.strips.into_iter().enumerate() {
                 st.normalize(i);
                 next_strips[i] = st;
             }
         } else {
+            if parsed.version < 3 {
+                next_input_pairs = [false, false, false, false, true, true, true, true];
+            }
             for st_in in parsed.strips {
                 let target_idx = match st_in.kind {
                     StripKind::Input if st_in.index < NUM_INPUT_STRIPS => Some(st_in.index),
-                    StripKind::Aux if st_in.index >= NUM_INPUT_STRIPS => {
-                        let a = st_in.index - NUM_INPUT_STRIPS;
-                        if a < MAX_AUX_PAIRS {
-                            Some(NUM_INPUT_STRIPS + a * 2)
-                        } else if a < NUM_AUX_STRIPS {
-                            Some(NUM_INPUT_STRIPS + a)
+                    StripKind::Aux => {
+                        let legacy_in_count = if parsed.version < 3 { 8 } else { NUM_INPUT_STRIPS };
+                        if st_in.index >= legacy_in_count {
+                            let a = st_in.index - legacy_in_count;
+                            if parsed.version < 2 && a < MAX_AUX_PAIRS {
+                                Some(NUM_INPUT_STRIPS + a * 2)
+                            } else if a < NUM_AUX_STRIPS {
+                                Some(NUM_INPUT_STRIPS + a)
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
@@ -455,6 +572,9 @@ impl UmcMixerApp {
                 };
                 if let Some(ti) = target_idx {
                     let mut st = st_in;
+                    if parsed.version < 3 && st.kind == StripKind::Input && st.output_route == OutputTargetRoute::None {
+                        st.output_route = OutputTargetRoute::MasterBus;
+                    }
                     st.normalize(ti);
                     next_strips[ti] = st;
                 }
@@ -462,12 +582,22 @@ impl UmcMixerApp {
         }
 
         self.strips = next_strips;
+        self.input_pair_stereo = next_input_pairs;
         self.aux_pair_stereo = parsed.aux_pair_stereo;
         self.player_loop = parsed.player_loop;
         self.player_gain = parsed.player_gain.clamp(0.0, 2.0);
         self.player_target = parsed.player_target.filter(|&i| i < NUM_INPUT_STRIPS);
 
-        self.sync_all_state_to_engine(true);
+        if let Some(buf) = parsed.buffer_frames {
+            let clamped = buf.clamp(64, 2048);
+            if clamped != self.requested_buffer_frames {
+                self.restart_audio_engine(parsed.selected_device.clone(), clamped);
+            } else {
+                self.sync_all_state_to_engine(true);
+            }
+        } else {
+            self.sync_all_state_to_engine(true);
+        }
 
         if let Some(track_path) = parsed.player_file_path {
             let p = Path::new(&track_path);
@@ -522,7 +652,7 @@ impl UmcMixerApp {
 
                 match instantiate_plugin(&desc) {
                     Ok(mut hosted) => {
-                        hosted.prepare(sr, 2048);
+                        hosted.prepare(sr, self.requested_buffer_frames.max(2048) as usize);
                         eprintln!(
                             "Insert chargé [{} / {:?}] sur tranche {} slot {}",
                             hosted.name(),
@@ -575,27 +705,48 @@ impl UmcMixerApp {
         }
     }
 
-    fn compute_scale(&self, ctx: &egui::Context) -> f32 {
-        match self.scale_mode {
+    fn apply_window_resize_scale(&mut self, ctx: &egui::Context) -> f32 {
+        let cur_ppp = ctx.pixels_per_point().max(0.4);
+        let screen = ctx.input(|i| i.screen_rect());
+        let phys_w = screen.width() * cur_ppp;
+        let phys_h = screen.height() * cur_ppp;
+        let base_ppp = *self
+            .native_ppp
+            .get_or_insert_with(|| ctx.native_pixels_per_point().unwrap_or(cur_ppp));
+
+        let target_zoom = match self.scale_mode {
             UiScaleMode::Auto => {
-                let rect = ctx.screen_rect();
-                let h_scale = ((rect.height() - 88.0) / 590.0).clamp(0.68, 1.08);
-                let w_scale = (rect.width() / 1400.0).clamp(0.76, 1.08);
-                (h_scale * 0.8 + w_scale * 0.2).clamp(0.70, 1.08)
+                let logical_w = phys_w / base_ppp;
+                let logical_h = phys_h / base_ppp;
+                (logical_w / 1200.0).min(logical_h / 700.0).clamp(0.45, 2.0)
             }
             UiScaleMode::Scale50 => 0.50,
             UiScaleMode::Scale75 => 0.75,
             UiScaleMode::Scale85 => 0.85,
             UiScaleMode::Scale100 => 1.00,
             UiScaleMode::Scale115 => 1.15,
+        };
+        let target_ppp = (base_ppp * target_zoom).clamp(0.45, 4.0);
+        if (cur_ppp - target_ppp).abs() > 0.015 {
+            ctx.set_pixels_per_point(target_ppp);
         }
+        1.0
     }
 
     fn visible_strip_indices(&self) -> Vec<usize> {
         let mut res = Vec::new();
         if self.view_filter != StripViewFilter::BusesOnly {
-            for i in 0..NUM_INPUT_STRIPS {
-                res.push(i);
+            let (p_start, p_end) = match self.input_bank {
+                InputBankFilter::All => (0, MAX_INPUT_PAIRS),
+                InputBankFilter::Bank1 => (0, 4),
+                InputBankFilter::Bank2 => (4, MAX_INPUT_PAIRS),
+            };
+            for p in p_start..p_end {
+                let base = p * 2;
+                res.push(base);
+                if !self.input_pair_stereo[p] {
+                    res.push(base + 1);
+                }
             }
         }
         if self.view_filter != StripViewFilter::InputsOnly {
@@ -629,25 +780,29 @@ impl UmcMixerApp {
             kind: &'static str,
             device: &'a str,
             sample_rate: u32,
+            buffer_frames: u32,
             in_channels: usize,
             out_channels: usize,
+            input_pair_stereo: [bool; MAX_INPUT_PAIRS],
             aux_pair_stereo: [bool; MAX_AUX_PAIRS],
             strips: &'a [StripState],
             player: RemotePlayerFull<'a>,
         }
 
-        let (sr, in_ch, out_ch) = self
+        let (sr, buf_frames, in_ch, out_ch) = self
             .engine
             .as_ref()
-            .map(|e| (e.sample_rate, e.in_channels, e.out_channels))
-            .unwrap_or((48000, 8, 10));
+            .map(|e| (e.sample_rate, e.buffer_frames, e.in_channels, e.out_channels))
+            .unwrap_or((48000, self.requested_buffer_frames, 8, 10));
 
         let pkt = RemoteStatePacket {
             kind: "state",
             device: &self.selected_device,
             sample_rate: sr,
+            buffer_frames: buf_frames,
             in_channels: in_ch,
             out_channels: out_ch,
+            input_pair_stereo: self.input_pair_stereo,
             aux_pair_stereo: self.aux_pair_stereo,
             strips: &self.strips,
             player: RemotePlayerFull {
@@ -735,6 +890,9 @@ impl UmcMixerApp {
                     self.send(MixerCommand::SetAuxSend { strip, aux_idx, level: lvl });
                 }
             }
+            RemoteCommand::SetInputPairStereo { pair, stereo } => {
+                self.toggle_input_pair_stereo(pair, stereo);
+            }
             RemoteCommand::SetAuxPairStereo { pair, stereo } => {
                 self.toggle_aux_pair_stereo(pair, stereo);
             }
@@ -750,9 +908,9 @@ impl UmcMixerApp {
                 }
             }
             RemoteCommand::SetOutputRoute { strip, kind, channel } => {
-                if strip < self.strips.len() && self.strips[strip].kind != StripKind::Input {
+                if strip < self.strips.len() {
                     let route = match kind.as_str() {
-                        "master" if self.strips[strip].kind == StripKind::Aux => {
+                        "master" if self.strips[strip].kind != StripKind::Master => {
                             OutputTargetRoute::MasterBus
                         }
                         "mono" => OutputTargetRoute::Mono(channel),
@@ -855,7 +1013,8 @@ impl eframe::App for UmcMixerApp {
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
 
-        let scale = self.compute_scale(ctx);
+        let scale = self.apply_window_resize_scale(ctx);
+        let active_sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48000);
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -866,37 +1025,32 @@ impl eframe::App for UmcMixerApp {
                     .show_ui(ui, |ui| {
                         for dev in self.devices.clone() {
                             if ui.selectable_label(self.selected_device == dev, &dev).clicked() {
-                                self.native_editors.close_all();
-                                self.native_handles =
-                                    std::array::from_fn(|_| std::array::from_fn(|_| None));
-                                self.offline_plugins =
-                                    std::array::from_fn(|_| std::array::from_fn(|_| None));
-                                self.engine = None;
-                                self.selected_device = dev.clone();
-                                match start_audio_engine(Some(&dev)) {
-                                    Ok(mut h) => {
-                                        self.midi_manager.attach_sender(h.midi_tx.take());
-                                        let master_idx = NUM_INPUT_STRIPS + NUM_AUX_STRIPS;
-                                        if h.out_channels < 10
-                                            && self.strips[master_idx].output_route
-                                                == OutputTargetRoute::StereoPair(8)
-                                        {
-                                            self.strips[master_idx].output_route =
-                                                OutputTargetRoute::StereoPair(0);
-                                        }
-                                        self.engine = Some(h);
-                                        self.status_error = None;
-                                    }
-                                    Err(e) => self.status_error = Some(e),
-                                }
-                                self.sync_all_state_to_engine(true);
+                                let buf = self.requested_buffer_frames;
+                                self.restart_audio_engine(Some(dev), buf);
+                            }
+                        }
+                    });
+
+                let cur_ms = (self.requested_buffer_frames as f32 / active_sr.max(1) as f32) * 1000.0;
+                egui::ComboBox::from_label("Latence")
+                    .selected_text(format!("{} smp ({:.1} ms)", self.requested_buffer_frames, cur_ms))
+                    .width(116.0)
+                    .show_ui(ui, |ui| {
+                        for &buf in &BUFFER_PRESETS {
+                            let ms = (buf as f32 / active_sr.max(1) as f32) * 1000.0;
+                            let lbl = format!("{buf} smp ({ms:.1} ms)");
+                            if ui
+                                .selectable_label(self.requested_buffer_frames == buf, lbl)
+                                .clicked()
+                            {
+                                self.restart_audio_engine(None, buf);
                             }
                         }
                     });
 
                 egui::ComboBox::from_label("Taille")
                     .selected_text(self.scale_mode.label())
-                    .width(64.0)
+                    .width(86.0)
                     .show_ui(ui, |ui| {
                         for mode in [
                             UiScaleMode::Auto,
@@ -912,7 +1066,7 @@ impl eframe::App for UmcMixerApp {
 
                 egui::ComboBox::from_label("Vue")
                     .selected_text(self.view_filter.label())
-                    .width(102.0)
+                    .width(92.0)
                     .show_ui(ui, |ui| {
                         for filter in [
                             StripViewFilter::All,
@@ -922,6 +1076,31 @@ impl eframe::App for UmcMixerApp {
                             ui.selectable_value(&mut self.view_filter, filter, filter.label());
                         }
                     });
+
+                let all_in_stereo = self.input_pair_stereo.iter().all(|&s| s);
+                let in_mode_label = if all_in_stereo {
+                    "Entrées: 8 Stéréo → 16 Mono"
+                } else {
+                    "Entrées: Mono → 8 Stéréo"
+                };
+                if ui.button(in_mode_label).clicked() {
+                    let target = !all_in_stereo;
+                    for p in 0..MAX_INPUT_PAIRS {
+                        self.toggle_input_pair_stereo(p, target);
+                    }
+                    if !target && self.input_bank == InputBankFilter::All {
+                        self.input_bank = InputBankFilter::Bank1;
+                    } else if target {
+                        self.input_bank = InputBankFilter::All;
+                    }
+                }
+                if ui
+                    .button(self.input_bank.label())
+                    .on_hover_text("Basculer la banque d'entrées affichée (1–8 / 9–16 / Tout)")
+                    .clicked()
+                {
+                    self.input_bank = self.input_bank.next();
+                }
 
                 let all_stereo = self.aux_pair_stereo.iter().all(|&s| s);
                 let aux_mode_label = if all_stereo {
@@ -1033,10 +1212,11 @@ impl eframe::App for UmcMixerApp {
                 }
 
                 if let Some(eng) = &self.engine {
+                    let ms = (eng.buffer_frames as f32 / eng.sample_rate.max(1) as f32) * 1000.0;
                     ui.label(
                         egui::RichText::new(format!(
-                            "{} Hz · {}IN/{}OUT",
-                            eng.sample_rate, eng.in_channels, eng.out_channels
+                            "{} Hz · {} smp ({:.1} ms) · {}IN/{}OUT",
+                            eng.sample_rate, eng.buffer_frames, ms, eng.in_channels, eng.out_channels
                         ))
                         .size(11.0)
                         .color(Color32::GRAY),
@@ -1253,19 +1433,19 @@ impl UmcMixerApp {
                             .size((12.0 * scale).clamp(9.5, 14.0)),
                     );
 
-                    // Sélecteur d'entrée (Input) ou de sortie (Aux / Master) tout en haut de la tranche
+                    // Sélecteur d'entrée (Input) + Sélecteur de sortie sur CHAQUE tranche
                     if kind == StripKind::Input {
-                        let cur_route = self.strips[idx].input_route;
+                        let cur_in_route = self.strips[idx].input_route;
                         egui::ComboBox::from_id_salt(format!("in_route_{idx}"))
-                            .selected_text(egui::RichText::new(format_input_route(cur_route)).size(text_sm))
+                            .selected_text(egui::RichText::new(format_input_route(cur_in_route)).size(text_sm))
                             .width(strip_w - 4.0)
                             .show_ui(ui, |ui| {
-                                let mut next = cur_route;
+                                let mut next = cur_in_route;
                                 let mut changed = false;
                                 changed |= ui
                                     .selectable_value(&mut next, InputSourceRoute::None, "Aucune / Synth")
                                     .changed();
-                                for ch in 0..in_ch_count.max(8) {
+                                for ch in 0..in_ch_count.max(16) {
                                     changed |= ui
                                         .selectable_value(
                                             &mut next,
@@ -1275,7 +1455,7 @@ impl UmcMixerApp {
                                         .changed();
                                 }
                                 let mut ch = 0;
-                                while ch + 1 < in_ch_count.max(8) {
+                                while ch + 1 < in_ch_count.max(16) {
                                     changed |= ui
                                         .selectable_value(
                                             &mut next,
@@ -1290,55 +1470,68 @@ impl UmcMixerApp {
                                     self.send(MixerCommand::SetInputRoute { strip: idx, route: next });
                                 }
                             });
-                    } else {
-                        let cur_route = self.strips[idx].output_route;
-                        egui::ComboBox::from_id_salt(format!("out_route_{idx}"))
-                            .selected_text(egui::RichText::new(format_output_route(cur_route)).size(text_sm))
-                            .width(strip_w - 4.0)
-                            .show_ui(ui, |ui| {
-                                let mut next = cur_route;
-                                let mut changed = false;
-                                changed |= ui
-                                    .selectable_value(&mut next, OutputTargetRoute::None, "Aucune")
-                                    .changed();
-                                if kind == StripKind::Aux {
-                                    changed |= ui
-                                        .selectable_value(
-                                            &mut next,
-                                            OutputTargetRoute::MasterBus,
-                                            "Vers Master",
-                                        )
-                                        .changed();
-                                }
-                                let mut ch = 0;
-                                while ch + 1 < out_ch_count.max(10) {
-                                    changed |= ui
-                                        .selectable_value(
-                                            &mut next,
-                                            OutputTargetRoute::StereoPair(ch),
-                                            format!("Out {}/{} (Stéréo)", ch + 1, ch + 2),
-                                        )
-                                        .changed();
-                                    ch += 2;
-                                }
-                                for ch_m in 0..out_ch_count.max(10) {
-                                    changed |= ui
-                                        .selectable_value(
-                                            &mut next,
-                                            OutputTargetRoute::Mono(ch_m),
-                                            format!("Out {} (Mono)", ch_m + 1),
-                                        )
-                                        .changed();
-                                }
-                                if changed {
-                                    self.strips[idx].output_route = next;
-                                    self.send(MixerCommand::SetOutputRoute { strip: idx, route: next });
-                                }
-                            });
                     }
 
-                    // 1. Gain rotatif (UNIQUEMENT sur les 8 tranches d'entrée, ou sélecteur Mono/Stéréo sur Aux)
+                    let cur_out_route = self.strips[idx].output_route;
+                    egui::ComboBox::from_id_salt(format!("out_route_{idx}"))
+                        .selected_text(egui::RichText::new(format_output_route(cur_out_route)).size(text_sm))
+                        .width(strip_w - 4.0)
+                        .show_ui(ui, |ui| {
+                            let mut next = cur_out_route;
+                            let mut changed = false;
+                            if kind != StripKind::Master {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut next,
+                                        OutputTargetRoute::MasterBus,
+                                        "Vers Master",
+                                    )
+                                    .changed();
+                            }
+                            changed |= ui
+                                .selectable_value(&mut next, OutputTargetRoute::None, "Sortie: Aucune")
+                                .changed();
+                            let mut ch = 0;
+                            while ch + 1 < out_ch_count.max(10) {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut next,
+                                        OutputTargetRoute::StereoPair(ch),
+                                        format!("Out {}/{} (Stéréo)", ch + 1, ch + 2),
+                                    )
+                                    .changed();
+                                ch += 2;
+                            }
+                            for ch_m in 0..out_ch_count.max(10) {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut next,
+                                        OutputTargetRoute::Mono(ch_m),
+                                        format!("Out {} (Mono)", ch_m + 1),
+                                    )
+                                    .changed();
+                            }
+                            if changed {
+                                self.strips[idx].output_route = next;
+                                self.send(MixerCommand::SetOutputRoute { strip: idx, route: next });
+                            }
+                        });
+
+                    // 1. Gain rotatif + Switch Stéréo/Mono sur les tranches d'entrée, ou sélecteur Mono/Stéréo sur Aux
                     if kind == StripKind::Input {
+                        let in_pair = idx / 2;
+                        let is_in_stereo = self.input_pair_stereo[in_pair];
+                        let switch_lbl = if is_in_stereo {
+                            "Stéréo → Mono"
+                        } else {
+                            "Mono → Stéréo"
+                        };
+                        if ui
+                            .small_button(egui::RichText::new(switch_lbl).size(text_sm * 0.9))
+                            .clicked()
+                        {
+                            self.toggle_input_pair_stereo(in_pair, !is_in_stereo);
+                        }
                         let mut gain = self.strips[idx].gain_db;
                         if rotary_knob(
                             ui,
@@ -1359,7 +1552,7 @@ impl UmcMixerApp {
                         let aux_i = idx - NUM_INPUT_STRIPS;
                         let pair = aux_i / 2;
                         let is_stereo = self.aux_pair_stereo[pair];
-                        let spacer_h = gain_knob_sz + (gain_knob_sz * 0.48).clamp(11.0, 16.0) + 6.0;
+                        let spacer_h = gain_knob_sz + (gain_knob_sz * 0.48).clamp(11.0, 16.0) + 28.0;
                         ui.allocate_ui(egui::vec2(strip_w, spacer_h), |ui| {
                             ui.vertical_centered(|ui| {
                                 ui.label(
@@ -1386,7 +1579,7 @@ impl UmcMixerApp {
                             });
                         });
                     } else {
-                        let spacer_h = gain_knob_sz + (gain_knob_sz * 0.48).clamp(11.0, 16.0) + 6.0;
+                        let spacer_h = gain_knob_sz + (gain_knob_sz * 0.48).clamp(11.0, 16.0) + 46.0;
                         ui.allocate_ui(egui::vec2(strip_w, spacer_h), |ui| {
                             ui.centered_and_justified(|ui| {
                                 ui.label(egui::RichText::new("BUS MASTER").size(text_sm).color(Color32::GRAY));

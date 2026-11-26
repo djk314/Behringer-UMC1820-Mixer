@@ -5,10 +5,12 @@ import {
   AuxSendsTuple,
   HardwareInputRoute,
   HardwareOutputRoute,
+  InputPairStereoState,
   InputSourceKind,
   MAX_AUX_PAIRS,
   MAX_INSERTS_PER_STRIP,
   MeterLevel,
+  NUM_INPUT_STRIPS,
   StripState,
   formatInputRouteLabel,
   formatOutputRouteLabel,
@@ -21,8 +23,10 @@ interface ChannelStripProps {
   strip: StripState;
   meter: MeterLevel;
   anySoloActive: boolean;
+  inputPairStereo: InputPairStereoState;
   auxPairStereo: AuxPairStereoState;
   hardwareChannels?: { in: number; out: number };
+  onToggleInputPair?: (pairIndex: number) => void;
   onToggleAuxPair?: (pairIndex: number) => void;
   onUpdate: (stripId: string, updater: (prev: StripState) => StripState) => void;
   onOpenInsertModal: (stripId: string, slotIndex: number) => void;
@@ -69,8 +73,10 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
   strip,
   meter,
   anySoloActive,
+  inputPairStereo,
   auxPairStereo,
   hardwareChannels = { in: 8, out: 10 },
+  onToggleInputPair,
   onToggleAuxPair,
   onUpdate,
   onOpenInsertModal,
@@ -80,8 +86,10 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
   const isInput = strip.kind === 'input';
 
   const isDimmedBySolo = !isMaster && anySoloActive && !strip.solo;
-  const pairIndex = isAux ? Math.floor((strip.index - 8) / 2) : -1;
-  const isAuxStereo = isAux && pairIndex >= 0 && auxPairStereo[pairIndex];
+  const inPairIndex = isInput ? Math.floor(strip.index / 2) : -1;
+  const isInputStereo = isInput && inPairIndex >= 0 && inputPairStereo[inPairIndex];
+  const auxPairIndex = isAux ? Math.floor((strip.index - NUM_INPUT_STRIPS) / 2) : -1;
+  const isAuxStereo = isAux && auxPairIndex >= 0 && auxPairStereo[auxPairIndex];
 
   const stripBg = isMaster
     ? 'bg-[#19161D] border-amber-500/30'
@@ -133,7 +141,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
         </div>
       </div>
 
-      {/* Top Hardware I/O Selector (every strip — adapts to any soundcard) */}
+      {/* Top Hardware I/O Selector (every strip — inputs have BOTH input + output selectors) */}
       {isInput ? (
         <div className="flex flex-col gap-1">
           <select
@@ -164,6 +172,36 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 </option>
               );
             })}
+          </select>
+
+          <select
+            aria-label={`Sortie directe ${strip.name}`}
+            value={serializeOutputRoute(strip.outputRoute)}
+            onChange={(e) => {
+              const nextRoute = parseOutputRoute(e.target.value);
+              onUpdate(strip.id, (s) => ({
+                ...s,
+                outputRoute: nextRoute,
+              }));
+            }}
+            className="w-full bg-[#0B0E14] border border-sky-500/30 rounded px-1.5 py-1 text-[10px] text-sky-200 focus:outline-none focus:border-sky-400 truncate"
+            title="Sélecteur de sortie (Master ou sortie matérielle directe)"
+          >
+            <option value="master">Vers Master</option>
+            <option value="none">Sortie : Aucune</option>
+            {Array.from({ length: Math.floor(outChannelCount / 2) }, (_, pair) => {
+              const ch = pair * 2;
+              return (
+                <option key={`in-out-s-${ch}`} value={`stereo:${ch}`}>
+                  Out {ch + 1}/{ch + 2} (Stéréo)
+                </option>
+              );
+            })}
+            {Array.from({ length: outChannelCount }, (_, ch) => (
+              <option key={`in-out-m-${ch}`} value={`mono:${ch}`}>
+                Out {ch + 1} (Mono)
+              </option>
+            ))}
           </select>
 
           <select
@@ -225,7 +263,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
           {isAux && onToggleAuxPair ? (
             <button
               type="button"
-              onClick={() => onToggleAuxPair(pairIndex)}
+              onClick={() => onToggleAuxPair(auxPairIndex)}
               className={`flex items-center justify-center gap-1 w-full rounded px-1.5 py-1 text-[10px] font-medium border cursor-pointer transition-colors ${
                 isAuxStereo
                   ? 'bg-sky-500/15 border-sky-500/40 text-sky-300 hover:bg-sky-500/25'
@@ -248,22 +286,43 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
         </div>
       )}
 
-      {/* Gain Rotary Knob — INPUT STRIPS ONLY (absent on Aux & Master) */}
-      <div className="flex items-center justify-center py-1 border-b border-[#232936]">
+      {/* Gain Rotary Knob & Input Pair Stereo/Mono Split — INPUT STRIPS ONLY */}
+      <div className="flex flex-col items-center justify-center gap-1.5 py-1 border-b border-[#232936]">
         {isInput ? (
-          <RotaryKnob
-            label="GAIN"
-            value={strip.gainDb}
-            min={-12}
-            max={24}
-            defaultValue={0}
-            unit="dB"
-            accentColor="#F59E0B"
-            size={36}
-            onChange={(val) =>
-              onUpdate(strip.id, (s) => ({ ...s, gainDb: val }))
-            }
-          />
+          <>
+            <RotaryKnob
+              label="GAIN"
+              value={strip.gainDb}
+              min={-12}
+              max={24}
+              defaultValue={0}
+              unit="dB"
+              accentColor="#F59E0B"
+              size={36}
+              onChange={(val) =>
+                onUpdate(strip.id, (s) => ({ ...s, gainDb: val }))
+              }
+            />
+            {onToggleInputPair && (
+              <button
+                type="button"
+                onClick={() => onToggleInputPair(inPairIndex)}
+                className={`flex items-center justify-center gap-1 w-full rounded px-1.5 py-0.5 text-[10px] font-medium border cursor-pointer transition-colors ${
+                  isInputStereo
+                    ? 'bg-amber-500/15 border-amber-500/40 text-amber-300 hover:bg-amber-500/25'
+                    : 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25'
+                }`}
+                title={
+                  isInputStereo
+                    ? 'Séparer cette paire en 2 tranches Mono indépendantes (double le nombre d’entrées)'
+                    : 'Recombiner en 1 tranche Stéréo'
+                }
+              >
+                <Split className="w-2.5 h-2.5 shrink-0" />
+                <span>{isInputStereo ? 'Stéréo → Mono' : 'Mono → Stéréo'}</span>
+              </button>
+            )}
+          </>
         ) : (
           <div className="h-[52px] flex flex-col items-center justify-center text-center px-1">
             <span className="text-[10px] font-medium text-slate-400">

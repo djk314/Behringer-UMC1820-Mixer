@@ -70,6 +70,17 @@ export type AuxSendsTuple = [
 ];
 
 export type AuxPairStereoState = [boolean, boolean, boolean, boolean];
+export type InputPairStereoState = [
+  boolean,
+  boolean,
+  boolean,
+  boolean,
+  boolean,
+  boolean,
+  boolean,
+  boolean,
+];
+export type AudioBufferLatencyPreset = 64 | 128 | 256 | 512 | 1024 | 2048;
 
 export interface StripState {
   id: string;
@@ -99,7 +110,9 @@ export interface StripState {
 
 export interface MixerSetSnapshot {
   version: number;
+  inputPairStereo?: InputPairStereoState;
   auxPairStereo: AuxPairStereoState;
+  bufferFrames?: AudioBufferLatencyPreset;
   strips: StripState[];
   playerLoop?: boolean;
   playerGain?: number;
@@ -122,6 +135,8 @@ export interface MeterLevel {
 }
 
 export const MAX_INSERTS_PER_STRIP = 5;
+export const MAX_INPUT_PAIRS = 8;
+export const NUM_INPUT_STRIPS = MAX_INPUT_PAIRS * 2;
 export const MAX_AUX_PAIRS = 4;
 export const NUM_AUX_BUSES = 8;
 

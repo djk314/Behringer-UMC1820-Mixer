@@ -1,6 +1,7 @@
 import {
   AuxPairStereoState,
   DspEffectType,
+  InputPairStereoState,
   InputSourceKind,
   InsertPluginSlot,
   MeterLevel,
@@ -246,6 +247,8 @@ export class WebAudioMixerEngine {
   private playerStartedAtCtxTime = 0;
   private playerTargetStripId: string | null = null;
 
+  private bufferFrames = 128;
+
   public isRunning(): boolean {
     return this.running && this.ctx?.state === 'running';
   }
@@ -254,24 +257,82 @@ export class WebAudioMixerEngine {
     return this.ctx?.sampleRate ?? 48000;
   }
 
+  public getLatencyMs(): number {
+    if (this.ctx) {
+      const base = this.ctx.baseLatency ?? 0;
+      const out = (this.ctx as AudioContext & { outputLatency?: number }).outputLatency ?? 0;
+      if (base + out > 0) {
+        return (base + out) * 1000;
+      }
+    }
+    return (this.bufferFrames / this.getSampleRate()) * 1000;
+  }
+
+  private resolveLatencyHint(frames: number): AudioContextLatencyCategory {
+    if (frames <= 256) return 'interactive';
+    if (frames <= 512) return 'balanced';
+    return 'playback';
+  }
+
   private ensureContext(strips: StripState[]): AudioContext {
     if (!this.ctx) {
       const AudioCtx =
         window.AudioContext ||
         (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      this.ctx = new AudioCtx({ latencyHint: 'interactive' });
+      this.ctx = new AudioCtx({ latencyHint: this.resolveLatencyHint(this.bufferFrames) });
       this.buildGraph(strips);
     }
     return this.ctx;
   }
 
-  public async start(strips: StripState[]): Promise<void> {
+  public async setBufferSize(
+    frames: number,
+    strips: StripState[],
+    inputPairStereo: InputPairStereoState,
+    auxPairStereo: AuxPairStereoState
+  ): Promise<void> {
+    this.bufferFrames = frames;
+    if (!this.ctx) return;
+    const wasRunning = this.isRunning();
+    const wasPlaying = this.playerPlaying;
+    const savedOffset = this.getPlayerStatus().posSecs;
+
+    this.teardownPlayerSource();
+    for (const chain of this.chains.values()) {
+      if (chain.sourceStopper) {
+        chain.sourceStopper();
+        chain.sourceStopper = null;
+      }
+      for (const bundle of chain.activeInserts) {
+        bundle.dispose();
+      }
+    }
+    this.chains.clear();
+    await this.ctx.close();
+    this.ctx = null;
+
+    if (wasRunning) {
+      await this.start(strips, inputPairStereo, auxPairStereo);
+      if (this.playerBuffer) {
+        this.playerOffsetSecs = savedOffset;
+        if (wasPlaying) {
+          this.startBufferSourceFrom(savedOffset);
+        }
+      }
+    }
+  }
+
+  public async start(
+    strips: StripState[],
+    inputPairStereo: InputPairStereoState = [true, true, true, true, true, true, true, true],
+    auxPairStereo: AuxPairStereoState = [true, true, true, true]
+  ): Promise<void> {
     const ctx = this.ensureContext(strips);
     if (ctx.state === 'suspended') {
       await ctx.resume();
     }
     this.running = true;
-    this.syncAll(strips, [true, true, true, true]);
+    this.syncAll(strips, inputPairStereo, auxPairStereo);
   }
 
   public async stop(): Promise<void> {
@@ -547,24 +608,48 @@ export class WebAudioMixerEngine {
     });
   }
 
-  public syncAll(strips: StripState[], auxPairStereo: AuxPairStereoState) {
+  public syncAll(
+    strips: StripState[],
+    inputPairStereo: InputPairStereoState,
+    auxPairStereo: AuxPairStereoState
+  ) {
     if (!this.ctx) return;
     const ctx = this.ctx;
 
-    const anyInputSolo = strips.some((s) => s.kind === 'input' && s.solo);
-    const anyAuxSolo = strips.some((s, idx) => {
+    let inSoloCursor = 0;
+    const anyInputSolo = strips.some((s) => {
+      if (s.kind !== 'input') return false;
+      const pair = Math.floor(inSoloCursor / 2);
+      const active = inputPairStereo[pair] ? inSoloCursor % 2 === 0 : true;
+      inSoloCursor++;
+      return active && s.solo;
+    });
+
+    let auxSoloCursor = 0;
+    const anyAuxSolo = strips.some((s) => {
       if (s.kind !== 'aux') return false;
-      const auxIndex = idx - 8;
-      const pair = Math.floor(auxIndex / 2);
-      const isActive = auxPairStereo[pair] ? auxIndex % 2 === 0 : true;
+      const pair = Math.floor(auxSoloCursor / 2);
+      const isActive = auxPairStereo[pair] ? auxSoloCursor % 2 === 0 : true;
+      auxSoloCursor++;
       return isActive && s.solo;
     });
     const anySolo = anyInputSolo || anyAuxSolo;
 
+    let inputCursor = 0;
     let auxCursor = 0;
     for (const strip of strips) {
       const chain = this.chains.get(strip.id);
       if (!chain) continue;
+
+      let isSecondaryInputInStereo = false;
+      if (strip.kind === 'input') {
+        const pair = Math.floor(inputCursor / 2);
+        const isStereo = inputPairStereo[pair] ?? true;
+        isSecondaryInputInStereo = isStereo && inputCursor % 2 === 1;
+        chain.inputSum.channelCount = isStereo ? 2 : 1;
+        chain.inputSum.channelCountMode = isStereo ? 'max' : 'explicit';
+        inputCursor++;
+      }
 
       // Gain (Input strips only; Aux and Master stay at unity 0 dB)
       const trimLinear = strip.kind === 'input' ? dbToGain(strip.gainDb) : 1;
@@ -579,16 +664,16 @@ export class WebAudioMixerEngine {
       chain.eqHigh.gain.setTargetAtTime(eqBypass ? 0 : strip.eq.highGainDb, ctx.currentTime, 0.02);
 
       // Mute / Solo (Master has no Solo!)
-      let isAudible = !strip.mute;
+      let isAudible = !strip.mute && !isSecondaryInputInStereo;
       if (strip.kind !== 'master' && anySolo) {
-        isAudible = strip.solo && !strip.mute;
+        isAudible = strip.solo && !strip.mute && !isSecondaryInputInStereo;
       }
       chain.muteSoloGain.gain.setTargetAtTime(isAudible ? 1 : 0, ctx.currentTime, 0.01);
 
       // Volume Fader
       chain.faderGain.gain.setTargetAtTime(dbToGain(strip.volumeDb), ctx.currentTime, 0.015);
 
-      // Output route gating & Mono/Stereo Aux channel mode
+      // Output route gating & Mono/Stereo channel mode
       if (strip.kind === 'aux') {
         const pair = Math.floor(auxCursor / 2);
         const isStereoPair = auxPairStereo[pair] ?? true;
@@ -602,13 +687,14 @@ export class WebAudioMixerEngine {
         const routeActive = strip.outputRoute.kind !== 'none';
         chain.outRouteGain.gain.setTargetAtTime(routeActive ? 1 : 0, ctx.currentTime, 0.015);
       } else {
-        chain.outRouteGain.gain.setTargetAtTime(1, ctx.currentTime, 0.015);
+        const routeActive = !isSecondaryInputInStereo && strip.outputRoute.kind !== 'none';
+        chain.outRouteGain.gain.setTargetAtTime(routeActive ? 1 : 0, ctx.currentTime, 0.015);
       }
 
       // 8 Aux Sends (respecting stereo link vs split mono)
       for (let p = 0; p < 4; p++) {
-        const sendL = (strip.auxSends[p * 2] ?? 0) / 100;
-        const sendR = (strip.auxSends[p * 2 + 1] ?? 0) / 100;
+        const sendL = isSecondaryInputInStereo ? 0 : (strip.auxSends[p * 2] ?? 0) / 100;
+        const sendR = isSecondaryInputInStereo ? 0 : (strip.auxSends[p * 2 + 1] ?? 0) / 100;
         if (auxPairStereo[p]) {
           chain.auxSends[p * 2].gain.setTargetAtTime(sendL, ctx.currentTime, 0.015);
           chain.auxSends[p * 2 + 1].gain.setTargetAtTime(0, ctx.currentTime, 0.015);
@@ -621,9 +707,12 @@ export class WebAudioMixerEngine {
       // Sync Inserts if plugin list changed
       this.syncInserts(chain, strip.inserts);
 
-      // Sync Input Source
-      if (strip.kind === 'input' && chain.currentSource !== strip.source) {
-        this.attachSource(chain, strip.source);
+      // Sync Input Source (disable inactive odd stereo half)
+      if (strip.kind === 'input') {
+        const desiredSource: InputSourceKind = isSecondaryInputInStereo ? 'none' : strip.source;
+        if (chain.currentSource !== desiredSource) {
+          this.attachSource(chain, desiredSource);
+        }
       }
     }
   }

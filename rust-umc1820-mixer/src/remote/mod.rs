@@ -1,3 +1,4 @@
+use crate::audio::state::{NUM_AUX_STRIPS, NUM_INPUT_STRIPS, TOTAL_STRIPS};
 use serde::{Deserialize, Serialize};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
@@ -21,6 +22,7 @@ pub enum RemoteCommand {
     SetEqBand { strip: usize, band: String, value_db: f32 },
     SetEqBypass { strip: usize, bypassed: bool },
     SetAuxSend { strip: usize, aux_idx: usize, level: f32 },
+    SetInputPairStereo { pair: usize, stereo: bool },
     SetAuxPairStereo { pair: usize, stereo: bool },
     SetInputRoute { strip: usize, kind: String, channel: usize },
     SetOutputRoute { strip: usize, kind: String, channel: usize },
@@ -684,9 +686,9 @@ fn parse_osc_packet(data: &[u8], cmd_tx: &mpsc::Sender<RemoteCommand>) {
         return;
     }
     let strip_idx = if parts[1] == "master" {
-        16
+        NUM_INPUT_STRIPS + NUM_AUX_STRIPS
     } else if let Ok(n) = parts[1].parse::<usize>() {
-        if n == 0 || n > 17 {
+        if n == 0 || n > TOTAL_STRIPS {
             return;
         }
         n - 1

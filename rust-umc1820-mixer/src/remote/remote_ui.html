@@ -158,8 +158,10 @@
     </div>
     <div class="controls">
       <button id="viewAll" class="active-amber" onclick="setView('all')">Toutes</button>
-      <button id="viewIn" onclick="setView('inputs')">Entrées 1–8</button>
+      <button id="viewIn" onclick="setView('inputs')">Entrées</button>
       <button id="viewBus" onclick="setView('buses')">Aux &amp; Master</button>
+      <button id="inModeBtn" class="active-sky" onclick="toggleAllInputs()">Entrées: 8 Stéréo → 16 Mono</button>
+      <button id="inBankBtn" onclick="cycleInputBank()">Banque IN: Tout</button>
       <button id="auxModeBtn" class="active-sky" onclick="toggleAllAux()">Aux: 4 Stéréo</button>
       <button id="clearSoloBtn" style="display:none;" class="active-amber" onclick="sendCmd({type:'clear_all_solo'})">Off Solo</button>
       <button onclick="togglePlayerBar()">Lecteur</button>
@@ -198,6 +200,7 @@
   let ws = null;
   let state = null;
   let currentView = 'all';
+  let inputBank = 'all'; // 'all' | 'b1' (1..8) | 'b2' (9..16)
   let showPlayer = true;
   let activeDragKey = null;
   let modalTarget = null;
@@ -211,6 +214,19 @@
     renderMixer();
   }
 
+  function cycleInputBank() {
+    inputBank = inputBank === 'all' ? 'b1' : inputBank === 'b1' ? 'b2' : 'all';
+    updateInputBankButton();
+    renderMixer();
+  }
+
+  function updateInputBankButton() {
+    const btn = document.getElementById('inBankBtn');
+    if (!btn) return;
+    btn.textContent = inputBank === 'b1' ? 'Banque IN: 1–8' : inputBank === 'b2' ? 'Banque IN: 9–16' : 'Banque IN: Tout';
+    btn.className = inputBank === 'all' ? '' : 'active-amber';
+  }
+
   function togglePlayerBar() {
     showPlayer = !showPlayer;
     document.getElementById('playerBar').style.display = showPlayer ? 'flex' : 'none';
@@ -220,6 +236,24 @@
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(obj));
     }
+  }
+
+  function toggleAllInputs() {
+    if (!state || !Array.isArray(state.input_pair_stereo)) return;
+    const allStereo = state.input_pair_stereo.every(Boolean);
+    const target = !allStereo;
+    for (let p = 0; p < state.input_pair_stereo.length; p++) {
+      state.input_pair_stereo[p] = target;
+      sendCmd({ type: 'set_input_pair_stereo', pair: p, stereo: target });
+    }
+    if (!target && inputBank === 'all') {
+      inputBank = 'b1';
+      updateInputBankButton();
+    } else if (target) {
+      inputBank = 'all';
+      updateInputBankButton();
+    }
+    renderMixer();
   }
 
   function toggleAllAux() {
@@ -305,9 +339,18 @@
 
   function renderStateSync() {
     if (!state) return;
-    document.getElementById('hwInfo').textContent = `${state.device} · ${state.in_channels}IN/${state.out_channels}OUT`;
+    const buf = state.buffer_frames || 128;
+    const sr = state.sample_rate || 48000;
+    const ms = ((buf / sr) * 1000).toFixed(1);
+    document.getElementById('hwInfo').textContent = `${state.device} · ${buf}smp (${ms}ms) · ${state.in_channels}IN/${state.out_channels}OUT`;
     const anySolo = state.strips.some(s => s.kind !== 'Master' && s.solo);
     document.getElementById('clearSoloBtn').style.display = anySolo ? 'inline-block' : 'none';
+    const inPairs = state.input_pair_stereo || [true, true, true, true, true, true, true, true];
+    const allInStereo = inPairs.every(Boolean);
+    const inBtn = document.getElementById('inModeBtn');
+    inBtn.textContent = allInStereo ? 'Entrées: 8 Stéréo → 16 Mono' : 'Entrées: Mono → 8 Stéréo';
+    inBtn.className = allInStereo ? 'active-sky' : 'active-emerald';
+    updateInputBankButton();
     const allStereo = state.aux_pair_stereo.every(Boolean);
     const auxBtn = document.getElementById('auxModeBtn');
     auxBtn.textContent = allStereo ? 'Aux: 4 Stéréo → Mono' : 'Aux: Mono → 4 Stéréo';
@@ -317,7 +360,6 @@
     if (!activeDragKey) {
       renderMixer();
     } else {
-      // Update non-dragged toggles cleanly
       state.strips.forEach((st, idx) => {
         const sBtn = document.getElementById(`solo-${idx}`);
         if (sBtn) sBtn.className = `btn-solo ${st.solo ? 'on' : ''}`;
@@ -347,9 +389,10 @@
     }
     document.getElementById('plTime').textContent = `${fmtTime(p.pos_secs)} / ${fmtTime(p.duration_secs)}`;
     const sel = document.getElementById('plTarget');
-    if (sel.options.length === 0) {
+    const inCount = state.strips ? state.strips.filter(s => s.kind === 'Input').length : 16;
+    if (sel.options.length !== inCount + 1) {
       sel.innerHTML = `<option value="">Master Direct</option>` +
-        Array.from({length: 8}, (_, i) => `<option value="${i}">Tranche ${i + 1}</option>`).join('');
+        Array.from({length: inCount}, (_, i) => `<option value="${i}">Tranche ${i + 1}</option>`).join('');
     }
     sel.value = p.target === null || p.target === undefined ? '' : String(p.target);
   }
@@ -378,17 +421,26 @@
   }
 
   function getVisibleIndices() {
-    if (!state) return [];
+    if (!state || !Array.isArray(state.strips)) return [];
     const res = [];
+    const inPairs = state.input_pair_stereo || [true, true, true, true, true, true, true, true];
+    const auxBase = state.strips.findIndex(s => s.kind === 'Aux');
+    const masterIdx = state.strips.findIndex(s => s.kind === 'Master');
+
     if (currentView !== 'buses') {
-      for (let i = 0; i < 8; i++) res.push(i);
-    }
-    if (currentView !== 'inputs') {
-      for (let p = 0; p < 4; p++) {
-        res.push(8 + p * 2);
-        if (!state.aux_pair_stereo[p]) res.push(8 + p * 2 + 1);
+      const pStart = inputBank === 'b2' ? 4 : 0;
+      const pEnd = inputBank === 'b1' ? 4 : inPairs.length;
+      for (let p = pStart; p < pEnd; p++) {
+        res.push(p * 2);
+        if (!inPairs[p]) res.push(p * 2 + 1);
       }
-      res.push(16);
+    }
+    if (currentView !== 'inputs' && auxBase >= 0) {
+      for (let p = 0; p < 4; p++) {
+        res.push(auxBase + p * 2);
+        if (!state.aux_pair_stereo[p]) res.push(auxBase + p * 2 + 1);
+      }
+      if (masterIdx >= 0) res.push(masterIdx);
     }
     return res;
   }
@@ -414,6 +466,8 @@
     const indices = getVisibleIndices();
     const inCh = Math.max(8, state.in_channels || 8);
     const outCh = Math.max(10, state.out_channels || 10);
+    const inPairs = state.input_pair_stereo || [true, true, true, true, true, true, true, true];
+    const auxBase = state.strips.findIndex(s => s.kind === 'Aux');
 
     container.innerHTML = indices.map((idx) => {
       const st = state.strips[idx];
@@ -421,26 +475,34 @@
       const isMaster = st.kind === 'Master';
       const isAux = st.kind === 'Aux';
       const isInput = st.kind === 'Input';
-      const pairIdx = isAux ? Math.floor((idx - 8) / 2) : -1;
-      const isAuxStereo = isAux && state.aux_pair_stereo[pairIdx];
+      const inPairIdx = isInput ? Math.floor(idx / 2) : -1;
+      const isInStereo = isInput && Boolean(inPairs[inPairIdx]);
+      const auxPairIdx = isAux && auxBase >= 0 ? Math.floor((idx - auxBase) / 2) : -1;
+      const isAuxStereo = isAux && auxPairIdx >= 0 && state.aux_pair_stereo[auxPairIdx];
+
+      let outOpts = `<option value="none:0">Sortie: Aucune</option>`;
+      if (isInput || isAux) outOpts += `<option value="master:0">Vers Master</option>`;
+      for (let c = 0; c + 1 < outCh; c += 2) outOpts += `<option value="stereo:${c}">Out ${c + 1}/${c + 2} (Stéréo)</option>`;
+      for (let c = 0; c < outCh; c++) outOpts += `<option value="mono:${c}">Out ${c + 1} (Mono)</option>`;
 
       let ioHtml = '';
       if (isInput) {
-        const cur = encodeInputRoute(st.input_route);
-        let opts = `<option value="none:0">Aucune / Synth</option>`;
-        for (let c = 0; c < inCh; c++) opts += `<option value="mono:${c}">In ${c + 1} (Mono)</option>`;
-        for (let c = 0; c + 1 < inCh; c += 2) opts += `<option value="stereo:${c}">In ${c + 1}/${c + 2} (Stéréo)</option>`;
-        ioHtml = `<select class="io-select" onchange="onInputRoute(${idx}, this.value)">${opts}</select>`;
+        let inOpts = `<option value="none:0">Aucune / Synth</option>`;
+        for (let c = 0; c < inCh; c++) inOpts += `<option value="mono:${c}">In ${c + 1} (Mono)</option>`;
+        for (let c = 0; c + 1 < inCh; c += 2) inOpts += `<option value="stereo:${c}">In ${c + 1}/${c + 2} (Stéréo)</option>`;
+        ioHtml = `
+          <select class="io-select in-select" onchange="onInputRoute(${idx}, this.value)">${inOpts}</select>
+          <select class="io-select out-select" onchange="onOutputRoute(${idx}, this.value)">${outOpts}</select>`;
       } else {
-        let opts = `<option value="none:0">Sortie: Aucune</option>`;
-        if (isAux) opts += `<option value="master:0">Vers Master</option>`;
-        for (let c = 0; c + 1 < outCh; c += 2) opts += `<option value="stereo:${c}">Out ${c + 1}/${c + 2} (Stéréo)</option>`;
-        for (let c = 0; c < outCh; c++) opts += `<option value="mono:${c}">Out ${c + 1} (Mono)</option>`;
-        ioHtml = `<select class="io-select" onchange="onOutputRoute(${idx}, this.value)">${opts}</select>`;
+        ioHtml = `<select class="io-select out-select" onchange="onOutputRoute(${idx}, this.value)">${outOpts}</select>`;
       }
 
       const topCtrlHtml = isInput
         ? `<div class="sec">
+             <button class="${isInStereo ? 'active-sky' : 'active-emerald'}" style="padding:4px;font-size:10px;"
+               onclick="sendCmd({type:'set_input_pair_stereo',pair:${inPairIdx},stereo:${!isInStereo}})">
+               ${isInStereo ? 'Stéréo → Mono' : 'Mono → Stéréo'}
+             </button>
              <div class="slider-row">
                <div class="slider-lbl"><span>GAIN</span><span id="gain-lbl-${idx}">${st.gain_db >= 0 ? '+' : ''}${st.gain_db.toFixed(1)} dB</span></div>
                <input type="range" min="-12" max="24" step="0.5" value="${st.gain_db}"
@@ -452,7 +514,7 @@
         : isAux
           ? `<div class="sec">
                <button class="${isAuxStereo ? 'active-sky' : 'active-emerald'}" style="padding:5px;font-size:11px;"
-                 onclick="sendCmd({type:'set_aux_pair_stereo',pair:${pairIdx},stereo:${!isAuxStereo}})">
+                 onclick="sendCmd({type:'set_aux_pair_stereo',pair:${auxPairIdx},stereo:${!isAuxStereo}})">
                  ${isAuxStereo ? 'Stéréo → Séparer Mono' : 'Mono → Lier Stéréo'}
                </button>
              </div>`
@@ -566,10 +628,10 @@
       const st = state.strips[idx];
       const sec = container.querySelector(`#fader-${idx}`)?.closest('.strip');
       if (sec) {
-        const sel = sec.querySelector('.io-select');
-        if (sel) {
-          sel.value = st.kind === 'Input' ? encodeInputRoute(st.input_route) : encodeOutputRoute(st.output_route);
-        }
+        const inSel = sec.querySelector('.in-select');
+        if (inSel) inSel.value = encodeInputRoute(st.input_route);
+        const outSel = sec.querySelector('.out-select');
+        if (outSel) outSel.value = encodeOutputRoute(st.output_route);
       }
       attachFaderTouch(idx);
     });

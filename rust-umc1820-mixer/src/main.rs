@@ -10,7 +10,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("UMC1820 Studio Mixer — CoreAudio / ALSA")
             .with_inner_size([1200.0, 700.0])
-            .with_min_inner_size([480.0, 360.0]),
+            .with_min_inner_size([320.0, 220.0]),
         ..Default::default()
     };
 

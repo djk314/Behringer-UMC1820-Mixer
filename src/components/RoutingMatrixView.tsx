@@ -2,7 +2,9 @@ import React from 'react';
 import {
   AuxPairStereoState,
   AuxSendsTuple,
+  InputPairStereoState,
   MAX_AUX_PAIRS,
+  MAX_INPUT_PAIRS,
   StripState,
   formatInputRouteLabel,
   formatOutputRouteLabel,
@@ -10,8 +12,10 @@ import {
 
 interface RoutingMatrixViewProps {
   strips: StripState[];
+  inputPairStereo: InputPairStereoState;
   auxPairStereo: AuxPairStereoState;
   onUpdateStrip: (stripId: string, updater: (prev: StripState) => StripState) => void;
+  onToggleInputPair: (pairIndex: number) => void;
   onToggleAuxPair: (pairIndex: number) => void;
 }
 
@@ -26,13 +30,23 @@ interface AuxMatrixColumn {
 
 export const RoutingMatrixView: React.FC<RoutingMatrixViewProps> = ({
   strips,
+  inputPairStereo,
   auxPairStereo,
   onUpdateStrip,
+  onToggleInputPair,
   onToggleAuxPair,
 }) => {
-  const inputStrips = strips.filter((s) => s.kind === 'input');
+  const allInputStrips = strips.filter((s) => s.kind === 'input');
   const auxStrips = strips.filter((s) => s.kind === 'aux');
   const masterStrip = strips.find((s) => s.kind === 'master');
+
+  const activeInputStrips: StripState[] = [];
+  for (let p = 0; p < MAX_INPUT_PAIRS; p++) {
+    const primary = allInputStrips[p * 2];
+    const secondary = allInputStrips[p * 2 + 1];
+    if (primary) activeInputStrips.push(primary);
+    if (!inputPairStereo[p] && secondary) activeInputStrips.push(secondary);
+  }
 
   const activeAuxColumns: AuxMatrixColumn[] = [];
   for (let p = 0; p < MAX_AUX_PAIRS; p++) {
@@ -76,28 +90,42 @@ export const RoutingMatrixView: React.FC<RoutingMatrixViewProps> = ({
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <div className="bg-[#131720] border border-[#232936] rounded-md p-4">
           <h2 className="text-sm font-semibold text-slate-100">
-            Chaîne Audio Multi-Cartes &amp; EQ 5 Bandes
+            Chaîne Audio Multi-Cartes &amp; Sorties Directes
           </h2>
           <p className="text-xs text-slate-400 mt-1.5 leading-relaxed">
-            Chaque tranche d'entrée et de sortie dispose d'un sélecteur matériel libre (<span className="font-mono text-slate-200">In 1..N</span>, <span className="font-mono text-slate-200">Out 1..N</span>) permettant d'utiliser toute interface audio CoreAudio ou ALSA/JACK en plus de l'UMC1820.
+            Chaque tranche (entrée, Aux, Master) dispose d'un sélecteur d'entrée et de sortie libre (<span className="font-mono text-slate-200">In 1..N</span>, <span className="font-mono text-slate-200">Vers Master</span>, <span className="font-mono text-slate-200">Out 1..N</span>) ainsi que d'un réglage de latence audio.
           </p>
           <div className="mt-3 pt-3 border-t border-[#232936] text-xs font-mono text-slate-300 space-y-1">
-            <div>Entrées 1–8 → Gain → 5 Inserts → EQ 5B (MID 1 kHz)</div>
-            <div>→ Mute/Solo → Fader → Master + Lecteur MP3/WAV</div>
+            <div>8 Stéréo → jusqu'à 16 Mono → Gain → 5 Inserts → EQ 5B</div>
+            <div>→ Mute/Solo → Fader → Master ou Sortie directe</div>
           </div>
         </div>
 
         <div className="bg-[#131720] border border-[#232936] rounded-md p-4">
           <h2 className="text-sm font-semibold text-slate-100">
-            Plugins (5 Inserts) &amp; Sets (.umcset)
+            Entrées Doublables (8 Stéréo ↔ 16 Mono)
           </h2>
           <p className="text-xs text-slate-400 mt-1.5 leading-relaxed">
-            Chaque tranche (8 entrées, jusqu'à 8 bus Aux et Master) accepte 5 inserts Apple AudioUnit, VST3 ou VST2, sauvegardables avec tous les réglages dans un fichier de set.
+            Séparez n'importe quelle paire d'entrées en 2 tranches Mono indépendantes, et utilisez le commutateur de banque <span className="font-mono text-amber-300">IN 1–8 / IN 9–16</span> pour éviter d'encombrer l'écran.
           </p>
-          <div className="mt-3 pt-3 border-t border-[#232936] text-[11px] font-mono text-slate-300 space-y-1">
-            <div>macOS : /Library/Audio/Plug-Ins/Components, VST3, VST</div>
-            <div>Linux : ~/.vst3, /usr/lib/vst3, ~/.vst (.so)</div>
-            <div>Sets : Export / Import complet (.umcset.json)</div>
+          <div className="mt-3 pt-3 border-t border-[#232936] flex flex-wrap gap-1.5">
+            {Array.from({ length: MAX_INPUT_PAIRS }, (_, p) => {
+              const stereo = inputPairStereo[p];
+              return (
+                <button
+                  key={`in-pair-toggle-${p}`}
+                  type="button"
+                  onClick={() => onToggleInputPair(p)}
+                  className={`px-2 py-1 rounded text-[11px] font-mono border cursor-pointer transition-colors ${
+                    stereo
+                      ? 'bg-amber-500/15 border-amber-500/40 text-amber-300 hover:bg-amber-500/25'
+                      : 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25'
+                  }`}
+                >
+                  IN {p * 2 + 1}/{p * 2 + 2}: {stereo ? 'Stéréo' : '2× Mono'}
+                </button>
+              );
+            })}
           </div>
         </div>
 
@@ -122,7 +150,7 @@ export const RoutingMatrixView: React.FC<RoutingMatrixViewProps> = ({
                       : 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25'
                   }`}
                 >
-                  {p * 2 + 1}/{p * 2 + 2}: {stereo ? 'Stéréo' : '2× Mono'}
+                  Aux {p * 2 + 1}/{p * 2 + 2}: {stereo ? 'Stéréo' : '2× Mono'}
                 </button>
               );
             })}
@@ -135,10 +163,10 @@ export const RoutingMatrixView: React.FC<RoutingMatrixViewProps> = ({
         <div className="px-4 py-3 border-b border-[#232936] flex items-center justify-between flex-wrap gap-2">
           <div>
             <h3 className="text-sm font-semibold text-slate-100">
-              Matrice des Envois Auxiliaires (8 Entrées → {activeAuxColumns.length} Bus actifs)
+              Matrice des Envois Auxiliaires ({activeInputStrips.length} Entrées actives → {activeAuxColumns.length} Bus Aux)
             </h3>
             <p className="text-xs text-slate-400">
-              Ajustez les départs et commutez chaque paire entre mode Stéréo et Mono séparé.
+              Ajustez les départs et commutez chaque paire d'entrées ou d'auxiliaires entre Stéréo et Mono séparé.
             </p>
           </div>
           {masterStrip && (
@@ -154,7 +182,8 @@ export const RoutingMatrixView: React.FC<RoutingMatrixViewProps> = ({
             <thead>
               <tr className="border-b border-[#232936] bg-[#0F131B] text-slate-400">
                 <th className="py-2.5 px-4 font-medium">Tranche d'entrée</th>
-                <th className="py-2.5 px-3 font-medium">Assignation HW</th>
+                <th className="py-2.5 px-3 font-medium">Entrée HW</th>
+                <th className="py-2.5 px-3 font-medium">Sortie directe</th>
                 <th className="py-2.5 px-3 font-medium">Inserts</th>
                 <th className="py-2.5 px-3 font-medium text-right">Gain</th>
                 {activeAuxColumns.map((col) => (
@@ -182,7 +211,7 @@ export const RoutingMatrixView: React.FC<RoutingMatrixViewProps> = ({
               </tr>
             </thead>
             <tbody className="divide-y divide-[#232936]">
-              {inputStrips.map((strip) => {
+              {activeInputStrips.map((strip) => {
                 const activePlugins = strip.inserts.filter((s) => s.plugin !== null);
                 return (
                   <tr key={strip.id} className="hover:bg-[#171C28] transition-colors">
@@ -191,6 +220,9 @@ export const RoutingMatrixView: React.FC<RoutingMatrixViewProps> = ({
                     </td>
                     <td className="py-2.5 px-3 font-mono text-[11px] text-amber-300/90 whitespace-nowrap">
                       {formatInputRouteLabel(strip.inputRoute)}
+                    </td>
+                    <td className="py-2.5 px-3 font-mono text-[11px] text-sky-300/90 whitespace-nowrap">
+                      {formatOutputRouteLabel(strip.outputRoute)}
                     </td>
                     <td className="py-2.5 px-3 font-mono text-[11px] text-slate-300 whitespace-nowrap">
                       {activePlugins.length}/5
